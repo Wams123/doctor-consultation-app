@@ -1,10 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                            HalfTrendSMC_EA.mq5   |
+//|  SELF-CONTAINED EA - No external indicators needed!               |
 //|                                                                   |
 //|  STRATEGY:                                                        |
 //|   1. HalfTrend flips to NEW trend (bull or bear)                  |
 //|   2. Price touches/wicks through the HalfTrend line               |
-//|      (even 1 pip/tick below line = touch in uptrend)              |
+//|      (even 1 tick below/above = touch)                            |
 //|   3. After touch: wait for internal BOS or CHoCH PRO-TREND        |
 //|   4. Entry at market on close of BOS/CHoCH bar                    |
 //|   5. SL = sequence low (BUY) / sequence high (SELL)               |
@@ -12,14 +13,10 @@
 //|   7. ONE trade per HalfTrend flip only                            |
 //|   8. Lot size = 1% account risk based on SL distance              |
 //|   9. Time filter for session control                              |
-//|                                                                   |
-//|  REQUIREMENTS:                                                    |
-//|   - Place HalfTrend.mq5 in MQL5/Indicators/                      |
-//|   - Place SmartMoneyConcepts.mq5 in MQL5/Indicators/              |
-//|   - Both indicators will be visible on chart during backtest      |
+//|  10. Draws HalfTrend + BOS/CHoCH on chart (visible in backtest)  |
 //+------------------------------------------------------------------+
 #property copyright "HalfTrend + SMC EA"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -32,23 +29,19 @@ input double InpRiskPercent      = 1.0;     // Risk % per trade
 input int    InpMagic            = 887766;  // Magic Number
 input int    InpSlippage         = 30;      // Slippage (points)
 input int    InpMaxSpreadPts     = 50;      // Max Spread (points, 0=off)
-input bool   InpOneTradeAtATime  = true;    // Only one trade at a time
 
 input group "═══════════ HALFTREND ═══════════"
 input int    InpHT_Amplitude     = 2;       // HalfTrend Amplitude
 input int    InpHT_ChannelDev    = 2;       // HalfTrend Channel Deviation
-input bool   InpHT_ShowArrows    = true;    // Show HT Arrows on chart
-input bool   InpHT_ShowChannels  = true;    // Show HT Channels on chart
 
 input group "═══════════ SMC ═══════════"
-input int    InpSMC_Style        = 0;       // SMC Style (0=Colored, 1=Mono)
-input int    InpSMC_InternalLen  = 5;       // Internal Swing Length
+input int    InpSMC_InternalLen  = 5;       // Internal Swing Length (BOS/CHoCH)
 input int    InpSMC_SwingLen     = 50;      // Major Swing Length (TP source)
 
 input group "═══════════ SETUP ═══════════"
 input int    InpTouchExpiry      = 20;      // Bars before touch expires
 input double InpMinRR            = 1.0;     // Minimum Risk:Reward (0=off)
-input int    InpSLBufferPts      = 30;      // SL buffer below/above (points)
+input int    InpSLBufferPts      = 30;      // SL buffer (points)
 
 input group "═══════════ TIME FILTER ═══════════"
 input bool   InpUseTimeFilter    = true;    // Enable Time Filter
@@ -62,122 +55,149 @@ input bool   InpMoveToBreakeven  = true;    // Move SL to Breakeven at +1R
 input bool   InpTrailWithHT      = false;   // Trail SL with HalfTrend line
 
 //+------------------------------------------------------------------+
+//| STRUCTURES                                                        |
+//+------------------------------------------------------------------+
+struct PivotPoint
+{
+   double   level;
+   double   lastLevel;
+   bool     crossed;
+   int      barIdx;
+};
+
+//+------------------------------------------------------------------+
 //| GLOBALS                                                          |
 //+------------------------------------------------------------------+
 CTrade      g_trade;
-int         g_htHandle    = INVALID_HANDLE;
-int         g_smcHandle   = INVALID_HANDLE;
+int         g_atrHandle = INVALID_HANDLE;
 datetime    g_lastBarTime = 0;
 
-//--- State Machine
-enum ENUM_EA_STATE
-{
-   STATE_WAIT_FLIP,       // Waiting for new HalfTrend flip
-   STATE_WAIT_TOUCH,      // HT flipped, waiting for price to touch HT line
-   STATE_WAIT_BOS,        // Touched, waiting for pro-trend BOS/CHoCH
-   STATE_DONE             // Trade taken for this flip, wait for next flip
-};
+//--- HalfTrend state
+double g_htLine[];        // HT line values (ring buffer not needed, use array)
+int    g_htTrend;         // 0=bull, 1=bear
+int    g_htPrevTrend;     // previous bar trend
+double g_ht_maxLow, g_ht_minHigh, g_ht_up, g_ht_down;
+int    g_ht_nextTrend;
 
-ENUM_EA_STATE g_state       = STATE_WAIT_FLIP;
-int           g_htTrend     = -1;     // current HT trend: 0=bull, 1=bear
-int           g_prevHTTrend = -1;     // previous HT trend (to detect flip)
-int           g_touchBarsAgo= -1;     // bars since the touch happened
-bool          g_tradeTaken  = false;  // flag: trade taken for current flip
+//--- SMC state
+PivotPoint g_intHigh, g_intLow;     // internal pivots
+PivotPoint g_swHigh, g_swLow;       // swing pivots
+int g_intTrendBias;                  // internal trend bias
+int g_swTrendBias;                   // swing trend bias
+double g_swingHigh, g_swingLow;     // current swing H/L for TP
+
+//--- EA State Machine
+enum ENUM_EA_STATE { STATE_WAIT_FLIP, STATE_WAIT_TOUCH, STATE_WAIT_BOS, STATE_DONE };
+ENUM_EA_STATE g_state;
+int    g_touchBarsAgo;
+bool   g_tradeTaken;
+double g_lastHTLine;      // HT line value on last closed bar
+
+//--- Drawing
+int g_objCount = 0;
+
+
 
 //+------------------------------------------------------------------+
-int OnInit()
+//| HELPERS                                                          |
+//+------------------------------------------------------------------+
+string MakeObjName(string prefix)
 {
-   g_trade.SetExpertMagicNumber(InpMagic);
-   g_trade.SetDeviationInPoints(InpSlippage);
-   g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   g_objCount++;
+   return "HTSMC_"+prefix+"_"+IntegerToString(g_objCount);
+}
 
-   //--- Create HalfTrend indicator handle
-   // Input order: InpAmplitude, InpChannelDeviation, InpShowArrows, InpShowChannels
-   g_htHandle = iCustom(_Symbol, _Period, "HalfTrend",
-                        InpHT_Amplitude,
-                        InpHT_ChannelDev,
-                        InpHT_ShowArrows,
-                        InpHT_ShowChannels);
-   if(g_htHandle == INVALID_HANDLE)
-   {
-      PrintFormat("EA ERROR: Failed to load HalfTrend indicator. Error: %d", GetLastError());
-      return(INIT_FAILED);
-   }
-
-   //--- Create SMC indicator handle
-   // Input order matches SmartMoneyConcepts.mq5:
-   //   InpStyle, InpShowInternals, InpInternalBull, InpInternalBullColor,
-   //   InpInternalBear, InpInternalBearColor, InpConfluenceFilter,
-   //   InpInternalLabelSize, InpInternalLength,
-   //   InpShowStructure, InpSwingBull, InpSwingBullColor,
-   //   InpSwingBear, InpSwingBearColor, InpSwingLabelSize,
-   //   InpShowSwings, InpSwingsLength, InpShowHighLowSwings,
-   //   InpShowEQHL, InpEQHLLength, InpEQHLThreshold, InpEQHLLabelSize
-   g_smcHandle = iCustom(_Symbol, _Period, "SmartMoneyConcepts",
-                         InpSMC_Style,        // Style
-                         true,                // ShowInternals
-                         0,                   // InternalBull = ALL
-                         clrGreen,            // InternalBullColor
-                         0,                   // InternalBear = ALL
-                         clrRed,              // InternalBearColor
-                         false,               // ConfluenceFilter
-                         0,                   // InternalLabelSize = TINY
-                         InpSMC_InternalLen,  // InternalLength
-                         true,                // ShowStructure
-                         0,                   // SwingBull = ALL
-                         clrGreen,            // SwingBullColor
-                         0,                   // SwingBear = ALL
-                         clrRed,              // SwingBearColor
-                         1,                   // SwingLabelSize = SMALL
-                         true,                // ShowSwings
-                         InpSMC_SwingLen,     // SwingsLength
-                         true,                // ShowHighLowSwings
-                         true,                // ShowEQHL
-                         3,                   // EQHLLength
-                         0.1,                 // EQHLThreshold
-                         0                    // EQHLLabelSize = TINY
-                         );
-   if(g_smcHandle == INVALID_HANDLE)
-   {
-      PrintFormat("EA ERROR: Failed to load SmartMoneyConcepts indicator. Error: %d", GetLastError());
-      return(INIT_FAILED);
-   }
-
-   g_state       = STATE_WAIT_FLIP;
-   g_htTrend     = -1;
-   g_prevHTTrend = -1;
-   g_touchBarsAgo= -1;
-   g_tradeTaken  = false;
-   g_lastBarTime = 0;
-
-   Print("EA Initialized: HalfTrend + SMC Strategy");
-   return(INIT_SUCCEEDED);
+void InitPivot(PivotPoint &p)
+{
+   p.level=0; p.lastLevel=0; p.crossed=false; p.barIdx=0;
 }
 
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason)
+//| DRAWING (visible in backtest)                                     |
+//+------------------------------------------------------------------+
+void DrawHTLine(datetime t1, datetime t2, double price, color clr)
 {
-   if(g_htHandle  != INVALID_HANDLE) IndicatorRelease(g_htHandle);
-   if(g_smcHandle != INVALID_HANDLE) IndicatorRelease(g_smcHandle);
-   Print("EA Deinitialized");
+   string n = MakeObjName("HTL");
+   ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price);
+   ObjectSetInteger(0, n, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, n, OBJPROP_BACK, true);
 }
 
-
-
-//+------------------------------------------------------------------+
-//| UTILITY: Read single buffer value at given shift                 |
-//+------------------------------------------------------------------+
-bool ReadBuf(int handle, int bufIdx, int shift, double &val)
+void DrawStructureLine(datetime t1, datetime t2, double price, color clr, bool dashed)
 {
-   double tmp[];
-   ArraySetAsSeries(tmp, true);
-   if(CopyBuffer(handle, bufIdx, shift, 1, tmp) <= 0) return false;
-   val = tmp[0];
-   return true;
+   string n = MakeObjName("SL");
+   ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price);
+   ObjectSetInteger(0, n, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, n, OBJPROP_STYLE, dashed ? STYLE_DASH : STYLE_SOLID);
+   ObjectSetInteger(0, n, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, n, OBJPROP_BACK, true);
+}
+
+void DrawLabel(datetime t, double price, string text, color clr, bool above)
+{
+   string n = MakeObjName("LB");
+   ObjectCreate(0, n, OBJ_TEXT, 0, t, price);
+   ObjectSetString(0, n, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, n, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, n, OBJPROP_FONTSIZE, 7);
+   ObjectSetInteger(0, n, OBJPROP_ANCHOR, above ? ANCHOR_LOWER : ANCHOR_UPPER);
+}
+
+void DrawArrow(datetime t, double price, color clr, int code)
+{
+   string n = MakeObjName("AR");
+   ObjectCreate(0, n, OBJ_ARROW, 0, t, price);
+   ObjectSetInteger(0, n, OBJPROP_ARROWCODE, code);
+   ObjectSetInteger(0, n, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
 }
 
 //+------------------------------------------------------------------+
-//| UTILITY: Check if we have an open position                       |
+//| UTILITY: Lot size based on % risk                                |
+//+------------------------------------------------------------------+
+double CalcLotSize(double slDistance)
+{
+   if(slDistance <= 0) return 0;
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * InpRiskPercent / 100.0;
+   double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lotStep    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(tickValue <= 0 || tickSize <= 0) return minLot;
+   double slTicks    = slDistance / tickSize;
+   double riskPerLot = slTicks * tickValue;
+   if(riskPerLot <= 0) return minLot;
+   double lots = riskAmount / riskPerLot;
+   lots = MathFloor(lots / lotStep) * lotStep;
+   lots = MathMax(lots, minLot);
+   lots = MathMin(lots, maxLot);
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| UTILITY: Time filter                                             |
+//+------------------------------------------------------------------+
+bool IsWithinTradingTime()
+{
+   if(!InpUseTimeFilter) return true;
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int cur   = dt.hour * 60 + dt.min;
+   int start = InpStartHour * 60 + InpStartMinute;
+   int end   = InpEndHour * 60 + InpEndMinute;
+   if(start < end)
+      return (cur >= start && cur < end);
+   else
+      return (cur >= start || cur < end);
+}
+
+//+------------------------------------------------------------------+
+//| UTILITY: Has open position                                       |
 //+------------------------------------------------------------------+
 bool HasOpenPosition()
 {
@@ -192,249 +212,287 @@ bool HasOpenPosition()
    return false;
 }
 
+
+
 //+------------------------------------------------------------------+
-//| UTILITY: Calculate lot size based on 1% risk                     |
+//| HALFTREND CALCULATION (built-in, no external indicator)          |
+//| Returns: HT line value for bar at shift                          |
+//| Updates: g_htTrend, g_ht_* state variables                      |
 //+------------------------------------------------------------------+
-double CalcLotSize(double slDistance)
+double CalcHalfTrend(int shift, double atrVal)
 {
-   if(slDistance <= 0) return 0;
+   double atr2 = (atrVal > 0) ? atrVal / 2.0 : 0;
 
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * InpRiskPercent / 100.0;
-   double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double lotStep    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   double minLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-
-   if(tickValue <= 0 || tickSize <= 0) return minLot;
-
-   double slTicks  = slDistance / tickSize;
-   double riskPerLot = slTicks * tickValue;
-   if(riskPerLot <= 0) return minLot;
-
-   double lots = riskAmount / riskPerLot;
-
-   // Round to lot step
-   lots = MathFloor(lots / lotStep) * lotStep;
-   lots = MathMax(lots, minLot);
-   lots = MathMin(lots, maxLot);
-
-   return NormalizeDouble(lots, 2);
-}
-
-//+------------------------------------------------------------------+
-//| UTILITY: Time filter check                                       |
-//+------------------------------------------------------------------+
-bool IsWithinTradingTime()
-{
-   if(!InpUseTimeFilter) return true;
-
-   MqlDateTime dt;
-   TimeCurrent(dt);
-   int currentMinutes = dt.hour * 60 + dt.min;
-   int startMinutes   = InpStartHour * 60 + InpStartMinute;
-   int endMinutes     = InpEndHour * 60 + InpEndMinute;
-
-   if(startMinutes < endMinutes)
-      return (currentMinutes >= startMinutes && currentMinutes < endMinutes);
-   else // overnight session (e.g., 22:00 - 06:00)
-      return (currentMinutes >= startMinutes || currentMinutes < endMinutes);
-}
-
-//+------------------------------------------------------------------+
-//| CORE: Update HalfTrend state and detect flip/touch               |
-//+------------------------------------------------------------------+
-void UpdateHalfTrendState()
-{
-   double trend = 0;
-   if(!ReadBuf(g_htHandle, 6, 1, trend)) return;
-
-   int currentTrend = (int)MathRound(trend);
-
-   // Detect FLIP
-   if(g_prevHTTrend >= 0 && currentTrend != g_prevHTTrend)
+   // Highest high / lowest low over amplitude
+   double highPrice = iHigh(_Symbol, _Period, shift);
+   double lowPrice  = iLow(_Symbol, _Period, shift);
+   for(int j = 1; j < InpHT_Amplitude; j++)
    {
-      // NEW HalfTrend flip!
-      g_state        = STATE_WAIT_TOUCH;
-      g_touchBarsAgo = -1;
-      g_tradeTaken   = false;
-      PrintFormat("EA: HalfTrend FLIP detected -> %s", currentTrend==0 ? "BULLISH" : "BEARISH");
+      double h = iHigh(_Symbol, _Period, shift + j);
+      double l = iLow(_Symbol, _Period, shift + j);
+      if(h > highPrice) highPrice = h;
+      if(l < lowPrice)  lowPrice  = l;
    }
 
-   g_prevHTTrend = g_htTrend;
-   g_htTrend     = currentTrend;
-}
-
-//+------------------------------------------------------------------+
-//| CORE: Check if price touched the HalfTrend line                  |
-//+------------------------------------------------------------------+
-void CheckForTouch()
-{
-   if(g_state != STATE_WAIT_TOUCH) return;
-   if(g_tradeTaken) return;
-
-   double htLine = 0;
-   if(!ReadBuf(g_htHandle, 0, 1, htLine)) return;
-   if(htLine <= 0) return;
-
-   double barHigh = iHigh(_Symbol, _Period, 1);
-   double barLow  = iLow(_Symbol, _Period, 1);
-
-   bool touched = false;
-
-   if(g_htTrend == 0) // Bullish trend -> touch = low reaches or goes below HT line
+   // SMA of high/low
+   double highma = 0, lowma = 0;
+   for(int j = 0; j < InpHT_Amplitude; j++)
    {
-      // Even 1 tick below counts
-      touched = (barLow <= htLine);
+      highma += iHigh(_Symbol, _Period, shift + j);
+      lowma  += iLow(_Symbol, _Period, shift + j);
    }
-   else if(g_htTrend == 1) // Bearish trend -> touch = high reaches or goes above HT line
+   highma /= InpHT_Amplitude;
+   lowma  /= InpHT_Amplitude;
+
+   double prevLow  = iLow(_Symbol, _Period, shift + 1);
+   double prevHigh = iHigh(_Symbol, _Period, shift + 1);
+   double closeNow = iClose(_Symbol, _Period, shift);
+
+   int trend     = g_htTrend;
+   int nextTrend = g_ht_nextTrend;
+   double maxLow = g_ht_maxLow;
+   double minHigh= g_ht_minHigh;
+   double up     = g_ht_up;
+   double down   = g_ht_down;
+
+   if(nextTrend == 1)
    {
-      touched = (barHigh >= htLine);
-   }
-
-   if(touched)
-   {
-      g_state        = STATE_WAIT_BOS;
-      g_touchBarsAgo = 0;
-      PrintFormat("EA: TOUCH detected! HT line=%.5f, barLow=%.5f, barHigh=%.5f",
-                  htLine, barLow, barHigh);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| CORE: Check for pro-trend BOS/CHoCH after touch                  |
-//+------------------------------------------------------------------+
-void CheckForEntry()
-{
-   if(g_state != STATE_WAIT_BOS) return;
-   if(g_tradeTaken) return;
-
-   // Increment touch age
-   g_touchBarsAgo++;
-
-   // Expire touch if too old
-   if(g_touchBarsAgo > InpTouchExpiry)
-   {
-      g_state = STATE_WAIT_TOUCH;  // go back to waiting for another touch
-      g_touchBarsAgo = -1;
-      Print("EA: Touch expired, going back to STATE_WAIT_TOUCH");
-      return;
-   }
-
-   // Check if one trade limit reached
-   if(InpOneTradeAtATime && HasOpenPosition()) return;
-
-   // Time filter
-   if(!IsWithinTradingTime()) return;
-
-   // Spread filter
-   if(InpMaxSpreadPts > 0)
-   {
-      long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-      if(spread > InpMaxSpreadPts) return;
-   }
-
-   // Read SMC buffers at shift=1 (just-closed bar)
-   double smcSignal=0, smcTag=0, seqLow=0, seqHigh=0, swingHigh=0, swingLow=0;
-   if(!ReadBuf(g_smcHandle, 0, 1, smcSignal)) return;
-   if(!ReadBuf(g_smcHandle, 1, 1, smcTag))    return;
-   if(!ReadBuf(g_smcHandle, 2, 1, seqLow))    return;
-   if(!ReadBuf(g_smcHandle, 3, 1, seqHigh))   return;
-   if(!ReadBuf(g_smcHandle, 4, 1, swingHigh)) return;
-   if(!ReadBuf(g_smcHandle, 5, 1, swingLow))  return;
-
-   // No signal on this bar
-   if(smcSignal == 0) return;
-
-   // Check pro-trend alignment
-   bool bullEntry = (g_htTrend == 0) && (smcSignal > 0.5);   // HT bull + bull BOS/CHoCH
-   bool bearEntry = (g_htTrend == 1) && (smcSignal < -0.5);  // HT bear + bear BOS/CHoCH
-
-   if(!bullEntry && !bearEntry) return;
-
-   // Validate levels
-   double pt     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double buffer = InpSLBufferPts * pt;
-
-   double sl=0, tp=0, entry=0;
-
-   if(bullEntry)
-   {
-      entry = ask;
-      sl    = seqLow - buffer;    // SL below lowest low of sequence + buffer
-      tp    = swingHigh;           // TP at swing high
-
-      if(sl <= 0 || tp <= 0 || tp <= entry || sl >= entry) return;
-   }
-   else // bearEntry
-   {
-      entry = bid;
-      sl    = seqHigh + buffer;   // SL above highest high of sequence + buffer
-      tp    = swingLow;            // TP at swing low
-
-      if(sl <= 0 || tp <= 0 || tp >= entry || sl <= entry) return;
-   }
-
-   // Risk:Reward check
-   double risk   = MathAbs(entry - sl);
-   double reward = MathAbs(tp - entry);
-   if(risk <= 0) return;
-   if(InpMinRR > 0 && (reward / risk) < InpMinRR) return;
-
-   // Stops level check
-   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist  = stopsLevel * pt;
-   if(MathAbs(entry - sl) < minDist) return;
-   if(MathAbs(tp - entry) < minDist) return;
-
-   // Normalize
-   sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
-
-   // Calculate lot size (1% risk)
-   double lots = CalcLotSize(risk);
-   if(lots <= 0) return;
-
-   // Execute trade
-   bool ok = false;
-   string comment = StringFormat("HT+SMC %s | RR=%.1f", bullEntry?"BUY":"SELL", reward/risk);
-
-   if(bullEntry)
-      ok = g_trade.Buy(lots, _Symbol, entry, sl, tp, comment);
-   else
-      ok = g_trade.Sell(lots, _Symbol, entry, sl, tp, comment);
-
-   if(ok)
-   {
-      PrintFormat("EA: %s OPENED | Lots=%.2f | Entry=%.5f | SL=%.5f | TP=%.5f | RR=%.2f | Tag=%s",
-                  bullEntry ? "BUY" : "SELL",
-                  lots, entry, sl, tp, reward/risk,
-                  ((int)MathRound(smcTag)==2) ? "CHoCH" : "BOS");
-
-      g_tradeTaken = true;
-      g_state      = STATE_DONE;
+      maxLow = MathMax(lowPrice, maxLow);
+      if(highma < maxLow && closeNow < prevLow)
+      {
+         trend     = 1;
+         nextTrend = 0;
+         minHigh   = highPrice;
+      }
    }
    else
    {
-      PrintFormat("EA: Order FAILED | Retcode=%d | %s",
-                  g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+      minHigh = MathMin(highPrice, minHigh);
+      if(lowma > minHigh && closeNow > prevHigh)
+      {
+         trend     = 0;
+         nextTrend = 1;
+         maxLow    = lowPrice;
+      }
+   }
+
+   if(trend == 0)
+   {
+      if(g_htTrend != 0)
+         up = down;
+      else
+         up = MathMax(maxLow, up);
+   }
+   else
+   {
+      if(g_htTrend != 1)
+         down = up;
+      else
+         down = MathMin(minHigh, down);
+   }
+
+   double ht = (trend == 0) ? up : down;
+
+   // Save state
+   g_htPrevTrend  = g_htTrend;
+   g_htTrend      = trend;
+   g_ht_nextTrend = nextTrend;
+   g_ht_maxLow    = maxLow;
+   g_ht_minHigh   = minHigh;
+   g_ht_up        = up;
+   g_ht_down      = down;
+
+   return ht;
+}
+
+//+------------------------------------------------------------------+
+//| SMC: Detect pivot highs/lows                                     |
+//+------------------------------------------------------------------+
+bool IsPivotHigh(int shift, int size)
+{
+   double pivotVal = iHigh(_Symbol, _Period, shift);
+   for(int i = 1; i <= size; i++)
+   {
+      if(iHigh(_Symbol, _Period, shift + i) > pivotVal) return false;
+      if(iHigh(_Symbol, _Period, shift - i) > pivotVal) return false;
+   }
+   return true;
+}
+
+bool IsPivotLow(int shift, int size)
+{
+   double pivotVal = iLow(_Symbol, _Period, shift);
+   for(int i = 1; i <= size; i++)
+   {
+      if(iLow(_Symbol, _Period, shift + i) < pivotVal) return false;
+      if(iLow(_Symbol, _Period, shift - i) < pivotVal) return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| SMC: Update internal pivots                                      |
+//+------------------------------------------------------------------+
+void UpdateInternalPivots(int confirmedShift)
+{
+   // Check for pivot at confirmedShift (needs InpSMC_InternalLen bars on each side)
+   int pivotShift = confirmedShift + InpSMC_InternalLen;
+
+   if(IsPivotHigh(pivotShift, InpSMC_InternalLen))
+   {
+      double val = iHigh(_Symbol, _Period, pivotShift);
+      if(val != g_intHigh.level)
+      {
+         g_intHigh.lastLevel = g_intHigh.level;
+         g_intHigh.level     = val;
+         g_intHigh.crossed   = false;
+         g_intHigh.barIdx    = pivotShift;
+      }
+   }
+
+   if(IsPivotLow(pivotShift, InpSMC_InternalLen))
+   {
+      double val = iLow(_Symbol, _Period, pivotShift);
+      if(val != g_intLow.level)
+      {
+         g_intLow.lastLevel = g_intLow.level;
+         g_intLow.level     = val;
+         g_intLow.crossed   = false;
+         g_intLow.barIdx    = pivotShift;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SMC: Update swing pivots (major - for TP)                        |
+//+------------------------------------------------------------------+
+void UpdateSwingPivots(int confirmedShift)
+{
+   int pivotShift = confirmedShift + InpSMC_SwingLen;
+
+   if(IsPivotHigh(pivotShift, InpSMC_SwingLen))
+   {
+      double val = iHigh(_Symbol, _Period, pivotShift);
+      if(val != g_swHigh.level)
+      {
+         g_swHigh.lastLevel = g_swHigh.level;
+         g_swHigh.level     = val;
+         g_swHigh.crossed   = false;
+         g_swHigh.barIdx    = pivotShift;
+         g_swingHigh        = val;
+      }
+   }
+
+   if(IsPivotLow(pivotShift, InpSMC_SwingLen))
+   {
+      double val = iLow(_Symbol, _Period, pivotShift);
+      if(val != g_swLow.level)
+      {
+         g_swLow.lastLevel = g_swLow.level;
+         g_swLow.level     = val;
+         g_swLow.crossed   = false;
+         g_swLow.barIdx    = pivotShift;
+         g_swingLow        = val;
+      }
    }
 }
 
 
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT: Breakeven + HT Trail                           |
+//| SMC: Check for BOS/CHoCH on just-closed bar (shift=1)            |
+//| Returns: +1 bullish break, -1 bearish break, 0 none              |
+//| Outputs: tag (1=BOS,2=CHoCH), seqLow, seqHigh                   |
+//+------------------------------------------------------------------+
+int CheckInternalBreak(double &seqLow, double &seqHigh, int &tag)
+{
+   double closeNow  = iClose(_Symbol, _Period, 1);
+   double closePrev = iClose(_Symbol, _Period, 2);
+
+   // Bullish break: close crosses above internal high pivot
+   if(g_intHigh.level > 0 && !g_intHigh.crossed)
+   {
+      if(closeNow > g_intHigh.level && closePrev <= g_intHigh.level)
+      {
+         g_intHigh.crossed = true;
+         tag = (g_intTrendBias == -1) ? 2 : 1;  // CHoCH or BOS
+         g_intTrendBias = +1;
+
+         // Sequence low = lowest low from pivot bar to current bar
+         double lo = iLow(_Symbol, _Period, 1);
+         for(int k = 1; k <= g_intHigh.barIdx; k++)
+         {
+            double l = iLow(_Symbol, _Period, k);
+            if(l < lo) lo = l;
+         }
+         seqLow = lo;
+
+         // Sequence high
+         double hi = iHigh(_Symbol, _Period, 1);
+         for(int k = 1; k <= g_intHigh.barIdx; k++)
+         {
+            double h = iHigh(_Symbol, _Period, k);
+            if(h > hi) hi = h;
+         }
+         seqHigh = hi;
+
+         // Draw on chart
+         datetime t1 = iTime(_Symbol, _Period, g_intHigh.barIdx);
+         datetime t2 = iTime(_Symbol, _Period, 1);
+         DrawStructureLine(t1, t2, g_intHigh.level, clrGreen, true);
+         datetime mt = (datetime)(((long)t1 + (long)t2) / 2);
+         DrawLabel(mt, g_intHigh.level, (tag==2)?"CHoCH":"BOS", clrGreen, true);
+
+         return +1;
+      }
+   }
+
+   // Bearish break: close crosses below internal low pivot
+   if(g_intLow.level > 0 && !g_intLow.crossed)
+   {
+      if(closeNow < g_intLow.level && closePrev >= g_intLow.level)
+      {
+         g_intLow.crossed = true;
+         tag = (g_intTrendBias == +1) ? 2 : 1;  // CHoCH or BOS
+         g_intTrendBias = -1;
+
+         // Sequence high = highest high from pivot bar to current bar
+         double hi = iHigh(_Symbol, _Period, 1);
+         for(int k = 1; k <= g_intLow.barIdx; k++)
+         {
+            double h = iHigh(_Symbol, _Period, k);
+            if(h > hi) hi = h;
+         }
+         seqHigh = hi;
+
+         // Sequence low
+         double lo = iLow(_Symbol, _Period, 1);
+         for(int k = 1; k <= g_intLow.barIdx; k++)
+         {
+            double l = iLow(_Symbol, _Period, k);
+            if(l < lo) lo = l;
+         }
+         seqLow = lo;
+
+         // Draw on chart
+         datetime t1 = iTime(_Symbol, _Period, g_intLow.barIdx);
+         datetime t2 = iTime(_Symbol, _Period, 1);
+         DrawStructureLine(t1, t2, g_intLow.level, clrRed, true);
+         datetime mt = (datetime)(((long)t1 + (long)t2) / 2);
+         DrawLabel(mt, g_intLow.level, (tag==2)?"CHoCH":"BOS", clrRed, false);
+
+         return -1;
+      }
+   }
+
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| TRADE MANAGEMENT                                                  |
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
-   double htLine = 0;
-   ReadBuf(g_htHandle, 0, 0, htLine);  // current bar HT line (for trailing)
-
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -453,91 +511,308 @@ void ManageOpenPositions()
 
       double newSL = curSL;
 
-      //--- Breakeven: move SL to entry after +1R profit
+      // Breakeven at +1R
       if(InpMoveToBreakeven && curSL != 0)
       {
          double oneR = MathAbs(openPr - curSL);
-         if(posType == POSITION_TYPE_BUY)
-         {
-            if(bid - openPr >= oneR && curSL < openPr)
-               newSL = openPr + 1*pt;  // +1 point to ensure BE isn't exact
-         }
-         else if(posType == POSITION_TYPE_SELL)
-         {
-            if(openPr - ask >= oneR && curSL > openPr)
-               newSL = openPr - 1*pt;
-         }
+         if(posType == POSITION_TYPE_BUY && bid - openPr >= oneR && curSL < openPr)
+            newSL = openPr + pt;
+         if(posType == POSITION_TYPE_SELL && openPr - ask >= oneR && curSL > openPr)
+            newSL = openPr - pt;
       }
 
-      //--- Trail with HalfTrend line
-      if(InpTrailWithHT && htLine > 0)
+      // Trail with HT line
+      if(InpTrailWithHT && g_lastHTLine > 0)
       {
-         if(posType == POSITION_TYPE_BUY)
-         {
-            // Only move SL up, never down
-            if(htLine > newSL && htLine < bid)
-               newSL = htLine;
-         }
-         else if(posType == POSITION_TYPE_SELL)
-         {
-            // Only move SL down, never up
-            if(htLine < newSL && htLine > ask)
-               newSL = htLine;
-         }
+         if(posType == POSITION_TYPE_BUY && g_lastHTLine > newSL && g_lastHTLine < bid)
+            newSL = g_lastHTLine;
+         if(posType == POSITION_TYPE_SELL && g_lastHTLine < newSL && g_lastHTLine > ask)
+            newSL = g_lastHTLine;
       }
 
-      // Apply modification if changed
       newSL = NormalizeDouble(newSL, digits);
       if(newSL != NormalizeDouble(curSL, digits) && newSL > 0)
-      {
-         if(g_trade.PositionModify(ticket, newSL, curTP))
-            PrintFormat("EA: SL modified to %.5f (was %.5f)", newSL, curSL);
-      }
+         g_trade.PositionModify(ticket, newSL, curTP);
+   }
+}
+
+
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetDeviationInPoints(InpSlippage);
+   g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+   g_atrHandle = iATR(_Symbol, _Period, 100);
+   if(g_atrHandle == INVALID_HANDLE)
+   {
+      Print("EA: Failed to create ATR handle");
+      return(INIT_FAILED);
+   }
+
+   // Init HT state
+   g_htTrend      = 0;
+   g_htPrevTrend  = 0;
+   g_ht_nextTrend = 0;
+   g_ht_maxLow    = 0;
+   g_ht_minHigh   = 99999;
+   g_ht_up        = 0;
+   g_ht_down      = 99999;
+   g_lastHTLine   = 0;
+
+   // Init SMC state
+   InitPivot(g_intHigh); InitPivot(g_intLow);
+   InitPivot(g_swHigh);  InitPivot(g_swLow);
+   g_intTrendBias = 0;
+   g_swTrendBias  = 0;
+   g_swingHigh    = 0;
+   g_swingLow     = 0;
+
+   // Init EA state
+   g_state        = STATE_WAIT_FLIP;
+   g_touchBarsAgo = -1;
+   g_tradeTaken   = false;
+   g_lastBarTime  = 0;
+   g_objCount     = 0;
+
+   Print("EA Initialized: HalfTrend + SMC (Self-Contained)");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
+
+   // Clean up chart objects
+   int total = ObjectsTotal(0, 0, -1);
+   for(int i = total-1; i >= 0; i--)
+   {
+      string n = ObjectName(0, i);
+      if(StringFind(n, "HTSMC_") == 0)
+         ObjectDelete(0, n);
    }
 }
 
 //+------------------------------------------------------------------+
-//| OnTick: Main event handler                                       |
+//| OnTick                                                           |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Manage positions on every tick (breakeven/trail)
+   // Manage positions every tick
    ManageOpenPositions();
 
-   //--- Only process logic on new bar
+   // Only process on new bar
    datetime t0 = iTime(_Symbol, _Period, 0);
    if(t0 == 0) return;
    if(t0 == g_lastBarTime) return;
    g_lastBarTime = t0;
 
-   //--- State machine on new bar (analyzing closed bar at shift=1)
-   UpdateHalfTrendState();
+   // Need enough bars
+   int barsNeeded = MathMax(InpSMC_SwingLen * 2 + 5, 200);
+   if(Bars(_Symbol, _Period) < barsNeeded) return;
 
+   //=== GET ATR ===
+   double atrBuf[];
+   if(CopyBuffer(g_atrHandle, 0, 1, 1, atrBuf) <= 0) return;
+   double atr = atrBuf[0];
+
+   //=== CALCULATE HALFTREND for bar[1] (just closed) ===
+   double htLine = CalcHalfTrend(1, atr);
+   g_lastHTLine = htLine;
+
+   // Draw HT line segment
+   if(htLine > 0)
+   {
+      datetime t1 = iTime(_Symbol, _Period, 2);
+      datetime t2 = iTime(_Symbol, _Period, 1);
+      color htColor = (g_htTrend == 0) ? clrDodgerBlue : clrCrimson;
+      DrawHTLine(t1, t2, htLine, htColor);
+   }
+
+   // Detect HT FLIP
+   bool htFlipped = (g_htPrevTrend >= 0 && g_htTrend != g_htPrevTrend);
+
+   if(htFlipped)
+   {
+      g_state        = STATE_WAIT_TOUCH;
+      g_touchBarsAgo = -1;
+      g_tradeTaken   = false;
+
+      // Draw flip arrow
+      datetime at = iTime(_Symbol, _Period, 1);
+      if(g_htTrend == 0)
+         DrawArrow(at, iLow(_Symbol, _Period, 1) - atr*0.3, clrDodgerBlue, 233);
+      else
+         DrawArrow(at, iHigh(_Symbol, _Period, 1) + atr*0.3, clrCrimson, 234);
+
+      PrintFormat("EA: HT FLIP -> %s", g_htTrend==0 ? "BULL" : "BEAR");
+   }
+
+   //=== UPDATE SMC PIVOTS ===
+   // Internal pivots (confirmed at shift = InpSMC_InternalLen)
+   if(Bars(_Symbol, _Period) > InpSMC_InternalLen * 2 + 2)
+      UpdateInternalPivots(1);
+
+   // Swing pivots (confirmed at shift = InpSMC_SwingLen)
+   if(Bars(_Symbol, _Period) > InpSMC_SwingLen * 2 + 2)
+      UpdateSwingPivots(1);
+
+   //=== STATE MACHINE ===
    switch(g_state)
    {
       case STATE_WAIT_FLIP:
-         // Do nothing, waiting for HT flip (handled in UpdateHalfTrendState)
+         // waiting, handled above
          break;
 
       case STATE_WAIT_TOUCH:
-         CheckForTouch();
+         CheckTouch();
          break;
 
       case STATE_WAIT_BOS:
-         CheckForEntry();
+         CheckEntry(atr);
          break;
 
       case STATE_DONE:
-         // Trade already taken for this flip. Only reset on next flip.
          break;
    }
 }
 
 //+------------------------------------------------------------------+
-//| OnTrade: Log trade events                                        |
+//| Check if price touched HT line                                   |
 //+------------------------------------------------------------------+
-void OnTrade()
+void CheckTouch()
 {
-   // Optional: can add trade logging here
+   if(g_tradeTaken) return;
+   if(g_lastHTLine <= 0) return;
+
+   double barHigh = iHigh(_Symbol, _Period, 1);
+   double barLow  = iLow(_Symbol, _Period, 1);
+
+   bool touched = false;
+   if(g_htTrend == 0)  // Bull: low touches or goes below HT line
+      touched = (barLow <= g_lastHTLine);
+   else                // Bear: high touches or goes above HT line
+      touched = (barHigh >= g_lastHTLine);
+
+   if(touched)
+   {
+      g_state        = STATE_WAIT_BOS;
+      g_touchBarsAgo = 0;
+      PrintFormat("EA: TOUCH! HT=%.5f Low=%.5f High=%.5f", g_lastHTLine, barLow, barHigh);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for pro-trend BOS/CHoCH entry                              |
+//+------------------------------------------------------------------+
+void CheckEntry(double atr)
+{
+   if(g_tradeTaken) return;
+
+   g_touchBarsAgo++;
+   if(g_touchBarsAgo > InpTouchExpiry)
+   {
+      g_state = STATE_WAIT_TOUCH;
+      g_touchBarsAgo = -1;
+      Print("EA: Touch expired");
+      return;
+   }
+
+   if(HasOpenPosition()) return;
+   if(!IsWithinTradingTime()) return;
+
+   // Spread filter
+   if(InpMaxSpreadPts > 0)
+   {
+      long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+      if(spread > InpMaxSpreadPts) return;
+   }
+
+   // Check for internal BOS/CHoCH
+   double seqLow = 0, seqHigh = 0;
+   int tag = 0;
+   int signal = CheckInternalBreak(seqLow, seqHigh, tag);
+
+   if(signal == 0) return;
+
+   // Pro-trend filter
+   bool bullEntry = (g_htTrend == 0) && (signal > 0);
+   bool bearEntry = (g_htTrend == 1) && (signal < 0);
+   if(!bullEntry && !bearEntry) return;
+
+   // Calculate SL/TP/Entry
+   double pt     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double buffer = InpSLBufferPts * pt;
+
+   double sl = 0, tp = 0, entry = 0;
+
+   if(bullEntry)
+   {
+      entry = ask;
+      sl    = seqLow - buffer;
+      tp    = g_swingHigh;
+      if(sl <= 0 || tp <= 0 || tp <= entry || sl >= entry) return;
+   }
+   else
+   {
+      entry = bid;
+      sl    = seqHigh + buffer;
+      tp    = g_swingLow;
+      if(sl <= 0 || tp <= 0 || tp >= entry || sl <= entry) return;
+   }
+
+   // RR check
+   double risk   = MathAbs(entry - sl);
+   double reward = MathAbs(tp - entry);
+   if(risk <= 0) return;
+   if(InpMinRR > 0 && (reward / risk) < InpMinRR) return;
+
+   // Stops level
+   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist  = stopsLevel * pt;
+   if(risk < minDist || reward < minDist) return;
+
+   sl = NormalizeDouble(sl, digits);
+   tp = NormalizeDouble(tp, digits);
+
+   // Lot size
+   double lots = CalcLotSize(risk);
+   if(lots <= 0) return;
+
+   // Execute
+   string comment = StringFormat("HT+SMC %s RR=%.1f", bullEntry?"BUY":"SELL", reward/risk);
+   bool ok = false;
+   if(bullEntry)
+      ok = g_trade.Buy(lots, _Symbol, entry, sl, tp, comment);
+   else
+      ok = g_trade.Sell(lots, _Symbol, entry, sl, tp, comment);
+
+   if(ok)
+   {
+      PrintFormat("EA: %s | Lots=%.2f | Entry=%.5f | SL=%.5f | TP=%.5f | RR=%.2f | %s",
+                  bullEntry?"BUY":"SELL", lots, entry, sl, tp, reward/risk,
+                  (tag==2)?"CHoCH":"BOS");
+      g_tradeTaken = true;
+      g_state      = STATE_DONE;
+
+      // Draw entry marker
+      datetime at = iTime(_Symbol, _Period, 1);
+      DrawArrow(at, entry, bullEntry?clrLime:clrOrangeRed, bullEntry?233:234);
+   }
+   else
+   {
+      PrintFormat("EA: FAILED | %d | %s", g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+   }
 }
 //+------------------------------------------------------------------+

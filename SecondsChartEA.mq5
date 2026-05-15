@@ -389,15 +389,15 @@ void FeedLiveData()
    datetime barTime = now - (now % InpSeconds);
 
    //--- Feed tick to custom symbol (updates its bid/ask)
-   MqlTick tick;
-   tick.time     = now;
-   tick.time_msc = (long)now * 1000;
-   tick.bid      = bid;
-   tick.ask      = ask;
-   tick.last     = bid;
-   tick.volume   = 1;
-   tick.flags    = TICK_FLAG_BID | TICK_FLAG_ASK;
-   CustomTicksAdd(g_customSymbol, tick);
+   MqlTick tickArr[1];
+   tickArr[0].time     = now;
+   tickArr[0].time_msc = (long)now * 1000;
+   tickArr[0].bid      = bid;
+   tickArr[0].ask      = ask;
+   tickArr[0].last     = bid;
+   tickArr[0].volume   = 1;
+   tickArr[0].flags    = TICK_FLAG_BID | TICK_FLAG_ASK;
+   CustomTicksAdd(g_customSymbol, tickArr);
 
    //--- Build/update the current N-second bar
    if(barTime != g_currentBarTime)

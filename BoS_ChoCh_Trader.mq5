@@ -258,6 +258,20 @@ double CalcLots(double slDist)
    lots = MathFloor(lots / lstp) * lstp;
    if(lots < lmin) lots = lmin;
    if(lots > lmax) lots = lmax;
+
+   //--- Check free margin before sending - cap lots to what we can afford
+   double margin = 0;
+   if(OrderCalcMargin(ORDER_TYPE_BUY, Symbol(), lots, SymbolInfoDouble(Symbol(), SYMBOL_ASK), margin))
+   {
+      double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+      if(margin > freeMargin * 0.8)  // Use max 80% of free margin
+      {
+         lots = lots * (freeMargin * 0.8) / margin;
+         lots = MathFloor(lots / lstp) * lstp;
+         if(lots < lmin) lots = lmin;
+      }
+   }
+
    return NormalizeDouble(lots, 2);
 }
 

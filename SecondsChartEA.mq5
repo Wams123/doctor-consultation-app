@@ -3,9 +3,9 @@
 //|                  Opens a TRUE 5-Second Custom Symbol Chart         |
 //|                  Uses CustomSymbol + CustomRatesUpdate             |
 //+------------------------------------------------------------------+
-#property copyright "SecondsChartEA v3"
+#property copyright "SecondsChartEA v4"
 #property link      ""
-#property version   "3.00"
+#property version   "4.00"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -32,6 +32,7 @@ bool     g_chartReady        = false;
 int      g_progress          = 0;
 uint     g_startTick         = 0;
 bool     g_symbolCreated     = false;
+bool     g_chartOpenedOnce   = false;
 
 // Live candle building
 datetime g_currentBarTime    = 0;
@@ -46,20 +47,41 @@ long     g_currentVolume     = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   g_startTick    = GetTickCount();
-   g_isLoading    = true;
-   g_chartReady   = false;
-   g_progress     = 0;
-   g_chartId      = 0;
-   g_currentBarTime = 0;
-
    //--- Build custom symbol name (e.g., "EURUSD_5s")
    g_customSymbol = Symbol() + "_" + IntegerToString(InpSeconds) + "s";
 
-   //--- Draw loading screen on current chart
-   DrawLoadingScreen();
+   //--- Check if custom chart already exists (re-init scenario)
+   g_chartId = FindExistingChart();
+   if(g_chartId > 0)
+   {
+      //--- Chart already open, just resume feeding data
+      g_isLoading      = false;
+      g_chartReady     = true;
+      g_symbolCreated  = true;
+      g_chartOpenedOnce = true;
+      g_currentBarTime = 0;
 
-   //--- Timer at 50ms for smooth loading animation
+      EventSetMillisecondTimer(1000);
+      Print("[SecondsChartEA] Resumed existing chart. ID=", g_chartId);
+      return(INIT_SUCCEEDED);
+   }
+
+   //--- Check if symbol already exists (previous crash/unclean shutdown)
+   if(SymbolExist(g_customSymbol, g_symbolCreated))
+   {
+      g_symbolCreated = true;
+   }
+
+   //--- Fresh start - show loading
+   g_startTick       = GetTickCount();
+   g_isLoading       = true;
+   g_chartReady      = false;
+   g_progress        = 0;
+   g_chartId         = 0;
+   g_currentBarTime  = 0;
+   g_chartOpenedOnce = false;
+
+   DrawLoadingScreen();
    EventSetMillisecondTimer(50);
 
    Print("[SecondsChartEA] Initializing ", InpSeconds, "s chart for ", Symbol());
@@ -74,22 +96,40 @@ void OnDeinit(const int reason)
    EventKillTimer();
    RemoveAllObjects(0);
 
-   //--- Close custom chart
-   if(g_chartId > 0)
+   //--- Only fully cleanup if EA is being removed from chart
+   //--- Do NOT close chart or delete symbol on timeframe change, recompile, etc.
+   if(reason == REASON_REMOVE || reason == REASON_PROGRAM)
    {
-      ChartClose(g_chartId);
-      g_chartId = 0;
+      if(g_chartId > 0)
+      {
+         ChartClose(g_chartId);
+         g_chartId = 0;
+      }
+      if(g_symbolCreated)
+      {
+         SymbolSelect(g_customSymbol, false);
+         CustomSymbolDelete(g_customSymbol);
+         g_symbolCreated = false;
+         Print("[SecondsChartEA] Custom symbol ", g_customSymbol, " deleted.");
+      }
    }
 
-   //--- Delete custom symbol
-   if(g_symbolCreated)
-   {
-      CustomSymbolDelete(g_customSymbol);
-      g_symbolCreated = false;
-      Print("[SecondsChartEA] Custom symbol ", g_customSymbol, " deleted.");
-   }
+   Print("[SecondsChartEA] Deinitialized. Reason=", reason);
+}
 
-   Print("[SecondsChartEA] Deinitialized.");
+//+------------------------------------------------------------------+
+//| Find existing chart for our custom symbol                          |
+//+------------------------------------------------------------------+
+long FindExistingChart()
+{
+   long chartId = ChartFirst();
+   while(chartId >= 0)
+   {
+      if(ChartSymbol(chartId) == g_customSymbol)
+         return chartId;
+      chartId = ChartNext(chartId);
+   }
+   return 0;
 }
 
 //+------------------------------------------------------------------+
@@ -110,11 +150,15 @@ void OnTimer()
          RemoveAllObjects(0);
          ChartRedraw(0);
 
-         //--- Create custom symbol and open chart
-         if(CreateCustomSymbolChart())
+         //--- Create custom symbol and open chart (only once)
+         if(!g_chartOpenedOnce)
          {
-            g_chartReady = true;
-            Print("[SecondsChartEA] ", InpSeconds, "s chart ready!");
+            if(CreateCustomSymbolChart())
+            {
+               g_chartReady = true;
+               g_chartOpenedOnce = true;
+               Print("[SecondsChartEA] ", InpSeconds, "s chart ready!");
+            }
          }
 
          //--- Switch timer to feed data every second
@@ -124,9 +168,32 @@ void OnTimer()
    }
    else
    {
-      //--- Feed live data to custom symbol every second
-      if(g_chartReady)
+      //--- Feed live data to custom symbol
+      if(g_chartReady && g_symbolCreated)
+      {
+         //--- Check if chart is still alive
+         if(g_chartId > 0)
+         {
+            long testId = ChartFirst();
+            bool found = false;
+            while(testId >= 0)
+            {
+               if(testId == g_chartId) { found = true; break; }
+               testId = ChartNext(testId);
+            }
+            if(!found)
+            {
+               //--- User closed the chart - stop feeding, don't reopen
+               g_chartId = 0;
+               g_chartReady = false;
+               EventKillTimer();
+               Print("[SecondsChartEA] Custom chart was closed by user. Stopped.");
+               return;
+            }
+         }
+
          FeedLiveData();
+      }
    }
 }
 
@@ -146,22 +213,25 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool CreateCustomSymbolChart()
 {
-   //--- Step 1: Create custom symbol
-   if(!CustomSymbolCreate(g_customSymbol, "Custom\\" + g_customSymbol, Symbol()))
+   //--- Step 1: Create custom symbol (skip if already exists)
+   if(!g_symbolCreated)
    {
-      //--- Maybe already exists, try to use it
-      if(GetLastError() != 5300) // ERR_CUSTOM_SYMBOL_EXIST
+      bool isCustom = false;
+      if(SymbolExist(g_customSymbol, isCustom))
       {
-         // Try deleting and recreating
-         CustomSymbolDelete(g_customSymbol);
+         //--- Already exists, reuse it
+         g_symbolCreated = true;
+      }
+      else
+      {
          if(!CustomSymbolCreate(g_customSymbol, "Custom\\" + g_customSymbol, Symbol()))
          {
             Print("[SecondsChartEA] ERROR: Cannot create custom symbol! Error=", GetLastError());
             return false;
          }
+         g_symbolCreated = true;
       }
    }
-   g_symbolCreated = true;
 
    //--- Step 2: Copy symbol properties from parent
    CustomSymbolSetInteger(g_customSymbol, SYMBOL_DIGITS, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS));
@@ -176,17 +246,20 @@ bool CreateCustomSymbolChart()
    //--- Step 3: Build historical N-second bars from ticks
    BuildHistoricalBars();
 
-   //--- Step 4: Select symbol in Market Watch (required to open chart)
+   //--- Step 4: Select symbol in Market Watch
    SymbolSelect(g_customSymbol, true);
 
-   //--- Step 5: Open chart with M1 (we feed custom rates so each M1 bar = our N seconds)
-   //--- Actually open on the custom symbol itself
-   g_chartId = ChartOpen(g_customSymbol, PERIOD_M1);
-
+   //--- Step 5: Check if chart already open (avoid duplicates)
+   g_chartId = FindExistingChart();
    if(g_chartId <= 0)
    {
-      Print("[SecondsChartEA] ERROR: Failed to open chart for ", g_customSymbol, "! Error=", GetLastError());
-      return false;
+      //--- Open new chart only if none exists
+      g_chartId = ChartOpen(g_customSymbol, PERIOD_M1);
+      if(g_chartId <= 0)
+      {
+         Print("[SecondsChartEA] ERROR: Failed to open chart! Error=", GetLastError());
+         return false;
+      }
    }
 
    //--- Step 6: Configure chart appearance
@@ -206,15 +279,18 @@ bool CreateCustomSymbolChart()
 
    //--- Add header label
    string hdr = PREFIX + "HDR";
-   ObjectCreate(g_chartId, hdr, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_YDISTANCE, 15);
-   ObjectSetString(g_chartId, hdr, OBJPROP_TEXT,
-      Symbol() + "  " + IntegerToString(InpSeconds) + " SECONDS CHART");
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_COLOR, clrWhite);
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_FONTSIZE, 12);
-   ObjectSetString(g_chartId, hdr, OBJPROP_FONT, "Segoe UI Bold");
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   if(ObjectFind(g_chartId, hdr) < 0)
+   {
+      ObjectCreate(g_chartId, hdr, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(g_chartId, hdr, OBJPROP_XDISTANCE, 15);
+      ObjectSetInteger(g_chartId, hdr, OBJPROP_YDISTANCE, 15);
+      ObjectSetString(g_chartId, hdr, OBJPROP_TEXT,
+         Symbol() + "  " + IntegerToString(InpSeconds) + " SECONDS CHART");
+      ObjectSetInteger(g_chartId, hdr, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(g_chartId, hdr, OBJPROP_FONTSIZE, 12);
+      ObjectSetString(g_chartId, hdr, OBJPROP_FONT, "Segoe UI Bold");
+      ObjectSetInteger(g_chartId, hdr, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   }
 
    ChartRedraw(g_chartId);
    Print("[SecondsChartEA] Chart opened: ", g_customSymbol, " ID=", g_chartId);
@@ -226,20 +302,18 @@ bool CreateCustomSymbolChart()
 //+------------------------------------------------------------------+
 void BuildHistoricalBars()
 {
-   //--- Get recent ticks from parent symbol
    MqlTick ticks[];
    int tickCount = CopyTicks(Symbol(), ticks, COPY_TICKS_ALL, 0, 50000);
 
    if(tickCount <= 0)
    {
-      Print("[SecondsChartEA] No ticks available, building from M1 rates instead.");
+      Print("[SecondsChartEA] No ticks available, building from M1 rates.");
       BuildFromM1Rates();
       return;
    }
 
    Print("[SecondsChartEA] Building ", InpSeconds, "s bars from ", tickCount, " ticks...");
 
-   //--- Aggregate ticks into N-second bars
    MqlRates bars[];
    ArrayResize(bars, 0);
 
@@ -256,19 +330,17 @@ void BuildHistoricalBars()
 
       if(tickBarStart != barStart)
       {
-         //--- Save completed bar
          int sz = ArraySize(bars);
          ArrayResize(bars, sz + 1);
-         bars[sz].time       = barStart;
-         bars[sz].open       = barOpen;
-         bars[sz].high       = barHigh;
-         bars[sz].low        = barLow;
-         bars[sz].close      = barClose;
+         bars[sz].time        = barStart;
+         bars[sz].open        = barOpen;
+         bars[sz].high        = barHigh;
+         bars[sz].low         = barLow;
+         bars[sz].close       = barClose;
          bars[sz].tick_volume = barVol;
-         bars[sz].spread     = 0;
+         bars[sz].spread      = 0;
          bars[sz].real_volume = 0;
 
-         //--- Start new bar
          barStart = tickBarStart;
          barOpen  = ticks[i].bid;
          barHigh  = ticks[i].bid;
@@ -281,7 +353,6 @@ void BuildHistoricalBars()
       }
       else
       {
-         //--- Update current bar
          barClose = ticks[i].bid;
          if(ticks[i].bid > barHigh) barHigh = ticks[i].bid;
          if(ticks[i].bid < barLow)  barLow  = ticks[i].bid;
@@ -294,32 +365,26 @@ void BuildHistoricalBars()
    {
       int sz = ArraySize(bars);
       ArrayResize(bars, sz + 1);
-      bars[sz].time       = barStart;
-      bars[sz].open       = barOpen;
-      bars[sz].high       = barHigh;
-      bars[sz].low        = barLow;
-      bars[sz].close      = barClose;
+      bars[sz].time        = barStart;
+      bars[sz].open        = barOpen;
+      bars[sz].high        = barHigh;
+      bars[sz].low         = barLow;
+      bars[sz].close       = barClose;
       bars[sz].tick_volume = barVol;
-      bars[sz].spread     = 0;
+      bars[sz].spread      = 0;
       bars[sz].real_volume = 0;
    }
 
-   //--- Push bars to custom symbol
    if(ArraySize(bars) > 0)
    {
       int added = CustomRatesUpdate(g_customSymbol, bars);
-      Print("[SecondsChartEA] Added ", added, " bars (", InpSeconds, "s each) to ", g_customSymbol);
-   }
-
-   //--- Set initial live bar tracking
-   if(ArraySize(bars) > 0)
-   {
+      Print("[SecondsChartEA] Added ", added, " bars to ", g_customSymbol);
       g_currentBarTime = bars[ArraySize(bars)-1].time + InpSeconds;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Fallback: Build from M1 rates if no ticks available                |
+//| Fallback: Build from M1 rates                                      |
 //+------------------------------------------------------------------+
 void BuildFromM1Rates()
 {
@@ -349,9 +414,9 @@ void BuildFromM1Rates()
          double pctS = (double)j / candlesPerM1;
          double pctE = (double)(j+1) / candlesPerM1;
 
-         bars[sz].time       = m1[i].time + j * InpSeconds;
-         bars[sz].open       = o + (c - o) * pctS;
-         bars[sz].close      = o + (c - o) * pctE;
+         bars[sz].time  = m1[i].time + j * InpSeconds;
+         bars[sz].open  = o + (c - o) * pctS;
+         bars[sz].close = o + (c - o) * pctE;
 
          double subRange = range / candlesPerM1;
          double noise = MathSin((j + 1.0) * M_PI / candlesPerM1) * subRange * 0.4;
@@ -361,7 +426,7 @@ void BuildFromM1Rates()
          if(bars[sz].low  < l) bars[sz].low  = l;
 
          bars[sz].tick_volume = m1[i].tick_volume / candlesPerM1;
-         bars[sz].spread     = 0;
+         bars[sz].spread      = 0;
          bars[sz].real_volume = 0;
       }
    }
@@ -369,13 +434,13 @@ void BuildFromM1Rates()
    if(ArraySize(bars) > 0)
    {
       int added = CustomRatesUpdate(g_customSymbol, bars);
-      Print("[SecondsChartEA] Fallback: Added ", added, " bars from M1 data.");
+      Print("[SecondsChartEA] Fallback: Added ", added, " bars from M1.");
       g_currentBarTime = bars[ArraySize(bars)-1].time + InpSeconds;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Feed live tick data to custom symbol as N-second bars              |
+//| Feed live tick data to custom symbol                                |
 //+------------------------------------------------------------------+
 void FeedLiveData()
 {
@@ -388,7 +453,7 @@ void FeedLiveData()
    datetime now = TimeCurrent();
    datetime barTime = now - (now % InpSeconds);
 
-   //--- Feed tick to custom symbol (updates its bid/ask)
+   //--- Feed tick to custom symbol
    MqlTick tickArr[1];
    tickArr[0].time     = now;
    tickArr[0].time_msc = (long)now * 1000;
@@ -402,7 +467,6 @@ void FeedLiveData()
    //--- Build/update the current N-second bar
    if(barTime != g_currentBarTime)
    {
-      //--- New bar started
       g_currentBarTime = barTime;
       g_currentOpen    = bid;
       g_currentHigh    = bid;
@@ -412,7 +476,6 @@ void FeedLiveData()
    }
    else
    {
-      //--- Update current bar
       g_currentClose = bid;
       if(bid > g_currentHigh) g_currentHigh = bid;
       if(bid < g_currentLow)  g_currentLow  = bid;
@@ -440,7 +503,6 @@ void DrawLoadingScreen()
    int w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
 
-   //--- Full dark overlay
    string bg = PREFIX + "LOAD_BG";
    ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 0);
@@ -452,7 +514,6 @@ void DrawLoadingScreen()
    ObjectSetInteger(0, bg, OBJPROP_BACK, false);
    ObjectSetInteger(0, bg, OBJPROP_CORNER, CORNER_LEFT_UPPER);
 
-   //--- Title
    string title = PREFIX + "LOAD_TITLE";
    ObjectCreate(0, title, OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, title, OBJPROP_XDISTANCE, w/2 - 150);
@@ -463,7 +524,6 @@ void DrawLoadingScreen()
    ObjectSetString(0, title, OBJPROP_FONT, "Segoe UI Semibold");
    ObjectSetInteger(0, title, OBJPROP_CORNER, CORNER_LEFT_UPPER);
 
-   //--- Progress bar background
    int barW = 360;
    int barH = 24;
    int barX = w/2 - barW/2;
@@ -481,7 +541,6 @@ void DrawLoadingScreen()
    ObjectSetInteger(0, barBg, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, barBg, OBJPROP_BACK, false);
 
-   //--- Progress bar fill
    string barFill = PREFIX + "LOAD_BARFILL";
    ObjectCreate(0, barFill, OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSetInteger(0, barFill, OBJPROP_XDISTANCE, barX + 2);
@@ -494,7 +553,6 @@ void DrawLoadingScreen()
    ObjectSetInteger(0, barFill, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, barFill, OBJPROP_BACK, false);
 
-   //--- Percent label
    string pct = PREFIX + "LOAD_PCT";
    ObjectCreate(0, pct, OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, pct, OBJPROP_XDISTANCE, w/2 - 15);
@@ -505,7 +563,6 @@ void DrawLoadingScreen()
    ObjectSetString(0, pct, OBJPROP_FONT, "Segoe UI");
    ObjectSetInteger(0, pct, OBJPROP_CORNER, CORNER_LEFT_UPPER);
 
-   //--- Status text
    string status = PREFIX + "LOAD_STATUS";
    ObjectCreate(0, status, OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, status, OBJPROP_XDISTANCE, w/2 - 120);
@@ -527,17 +584,14 @@ void UpdateLoadingBar(int percent)
    int w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int barW = 360;
 
-   //--- Fill bar
    string barFill = PREFIX + "LOAD_BARFILL";
    int fillW = (int)((barW - 4) * percent / 100);
    if(fillW < 1) fillW = 1;
    ObjectSetInteger(0, barFill, OBJPROP_XSIZE, fillW);
 
-   //--- Percent text
    string pct = PREFIX + "LOAD_PCT";
    ObjectSetString(0, pct, OBJPROP_TEXT, IntegerToString(percent) + "%");
 
-   //--- Dynamic status messages
    string status = PREFIX + "LOAD_STATUS";
    if(percent < 15)
       ObjectSetString(0, status, OBJPROP_TEXT, "Creating custom symbol...");

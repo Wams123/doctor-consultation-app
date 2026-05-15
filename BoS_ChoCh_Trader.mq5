@@ -434,6 +434,12 @@ void ExecuteBuy(double slPrice, string comment)
       return;
    }
 
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      Print("[BoS_ChoCh_Trader] TRADING NOT ALLOWED! Enable AutoTrading.");
+      return;
+   }
+
    double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
    double point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
@@ -443,11 +449,11 @@ void ExecuteBuy(double slPrice, string comment)
       slPrice = ask - 50 * point;
 
    double slDistance = ask - slPrice;
-   if(slDistance <= 0) return;
+   if(slDistance <= 0) { Print("[BoS_ChoCh_Trader] BUY skip: SL distance <= 0"); return; }
 
    //--- Calculate lot size based on risk %
    double lots = CalculateLotSize(slDistance);
-   if(lots <= 0) return;
+   if(lots <= 0) { Print("[BoS_ChoCh_Trader] BUY skip: lots <= 0"); return; }
 
    //--- TP based on R:R
    double tp = 0;
@@ -455,17 +461,37 @@ void ExecuteBuy(double slPrice, string comment)
       tp = NormalizeDouble(ask + slDistance * InpRR, digits);
 
    double sl = NormalizeDouble(slPrice, digits);
+   double price = NormalizeDouble(ask, digits);
 
-   CTrade trade;
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetDeviationInPoints(InpSlippage);
+   Print("[BoS_ChoCh_Trader] Attempting BUY: price=", price, " sl=", sl, " tp=", tp, " lots=", lots);
 
-   if(trade.Buy(lots, Symbol(), 0, sl, tp, "SMC_" + comment))
-      Print("[BoS_ChoCh_Trader] BUY ", comment, " | Lots=", lots,
-            " | SL=", sl, " | TP=", tp);
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = Symbol();
+   request.volume       = lots;
+   request.type         = ORDER_TYPE_BUY;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = InpSlippage;
+   request.magic        = InpMagic;
+   request.comment      = "SMC_" + comment;
+   request.type_filling = ORDER_FILLING_IOC;
+
+   if(!OrderSend(request, result))
+   {
+      Print("[BoS_ChoCh_Trader] BUY FAILED! retcode=", result.retcode, " error=", GetLastError());
+      //--- Try with FOK filling
+      request.type_filling = ORDER_FILLING_FOK;
+      if(!OrderSend(request, result))
+         Print("[BoS_ChoCh_Trader] BUY FAILED (FOK)! retcode=", result.retcode);
+      else
+         Print("[BoS_ChoCh_Trader] BUY SUCCESS (FOK) ", comment, " | Lots=", lots, " | SL=", sl, " | TP=", tp);
+   }
    else
-      Print("[BoS_ChoCh_Trader] BUY FAILED! Error=", GetLastError(),
-            " RetCode=", trade.ResultRetcode(), " Desc=", trade.ResultRetcodeDescription());
+      Print("[BoS_ChoCh_Trader] BUY SUCCESS ", comment, " | Lots=", lots, " | SL=", sl, " | TP=", tp);
 }
 
 //+------------------------------------------------------------------+
@@ -479,6 +505,12 @@ void ExecuteSell(double slPrice, string comment)
       return;
    }
 
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      Print("[BoS_ChoCh_Trader] TRADING NOT ALLOWED! Enable AutoTrading.");
+      return;
+   }
+
    double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
    double point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
@@ -488,11 +520,11 @@ void ExecuteSell(double slPrice, string comment)
       slPrice = bid + 50 * point;
 
    double slDistance = slPrice - bid;
-   if(slDistance <= 0) return;
+   if(slDistance <= 0) { Print("[BoS_ChoCh_Trader] SELL skip: SL distance <= 0"); return; }
 
    //--- Calculate lot size based on risk %
    double lots = CalculateLotSize(slDistance);
-   if(lots <= 0) return;
+   if(lots <= 0) { Print("[BoS_ChoCh_Trader] SELL skip: lots <= 0"); return; }
 
    //--- TP based on R:R
    double tp = 0;
@@ -500,17 +532,37 @@ void ExecuteSell(double slPrice, string comment)
       tp = NormalizeDouble(bid - slDistance * InpRR, digits);
 
    double sl = NormalizeDouble(slPrice, digits);
+   double price = NormalizeDouble(bid, digits);
 
-   CTrade trade;
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetDeviationInPoints(InpSlippage);
+   Print("[BoS_ChoCh_Trader] Attempting SELL: price=", price, " sl=", sl, " tp=", tp, " lots=", lots);
 
-   if(trade.Sell(lots, Symbol(), 0, sl, tp, "SMC_" + comment))
-      Print("[BoS_ChoCh_Trader] SELL ", comment, " | Lots=", lots,
-            " | SL=", sl, " | TP=", tp);
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = Symbol();
+   request.volume       = lots;
+   request.type         = ORDER_TYPE_SELL;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = InpSlippage;
+   request.magic        = InpMagic;
+   request.comment      = "SMC_" + comment;
+   request.type_filling = ORDER_FILLING_IOC;
+
+   if(!OrderSend(request, result))
+   {
+      Print("[BoS_ChoCh_Trader] SELL FAILED! retcode=", result.retcode, " error=", GetLastError());
+      //--- Try with FOK filling
+      request.type_filling = ORDER_FILLING_FOK;
+      if(!OrderSend(request, result))
+         Print("[BoS_ChoCh_Trader] SELL FAILED (FOK)! retcode=", result.retcode);
+      else
+         Print("[BoS_ChoCh_Trader] SELL SUCCESS (FOK) ", comment, " | Lots=", lots, " | SL=", sl, " | TP=", tp);
+   }
    else
-      Print("[BoS_ChoCh_Trader] SELL FAILED! Error=", GetLastError(),
-            " RetCode=", trade.ResultRetcode(), " Desc=", trade.ResultRetcodeDescription());
+      Print("[BoS_ChoCh_Trader] SELL SUCCESS ", comment, " | Lots=", lots, " | SL=", sl, " | TP=", tp);
 }
 
 //+------------------------------------------------------------------+

@@ -13,8 +13,8 @@
 //| INPUT PARAMETERS                                                   |
 //+------------------------------------------------------------------+
 input string   sep0           = "=== Structure Settings ===";
-input int      InpPivotLB     = 3;          // Pivot Left Bars
-input int      InpPivotRB     = 3;          // Pivot Right Bars
+input int      InpPivotLB     = 2;          // Pivot Left Bars
+input int      InpPivotRB     = 2;          // Pivot Right Bars
 input bool     InpTradeBOS    = true;       // Trade on BOS
 input bool     InpTradeChoCh  = true;       // Trade on ChoCh
 
@@ -79,7 +79,7 @@ int OnInit()
    g_lastSignalBar  = -1;
 
    if(InpUseSeconds)
-      EventSetMillisecondTimer(500);  // Check every 500ms for new candle close
+      EventSetMillisecondTimer(100);  // Check every 100ms for real-time detection
 
    Print("[BoS_ChoCh_Trader] Initialized. Risk=", InpRiskPercent, "% | ",
          InpSeconds, "s candles | Magic=", InpMagic);
@@ -135,10 +135,6 @@ void ProcessTick()
 
    if(barTime != g_currentBarTime)
    {
-      //--- Previous candle just closed - check for signals
-      if(g_candleCount > 0)
-         CheckStructure();
-
       //--- Start new candle
       g_currentBarTime = barTime;
       g_candleCount++;
@@ -152,6 +148,9 @@ void ProcessTick()
       //--- Keep max 500 candles in memory
       if(g_candleCount > 500)
          TrimCandles();
+
+      //--- On every new candle, scan for new pivots that just confirmed
+      ScanForNewPivots();
    }
    else if(g_candleCount > 0)
    {
@@ -161,6 +160,10 @@ void ProcessTick()
       if(bid > g_candles[idx].high) g_candles[idx].high = bid;
       if(bid < g_candles[idx].low)  g_candles[idx].low  = bid;
    }
+
+   //--- Check for break on EVERY tick (real-time detection)
+   if(g_candleCount > 0)
+      CheckBreak();
 }
 
 //+------------------------------------------------------------------+
@@ -201,92 +204,112 @@ void ProcessChartBars()
 }
 
 //+------------------------------------------------------------------+
-//| Check structure on the last closed candle (seconds mode)           |
+//| Scan for newly confirmed pivots                                    |
+//+------------------------------------------------------------------+
+void ScanForNewPivots()
+{
+   //--- A pivot is confirmed when we have InpPivotRB candles after it
+   //--- The pivot bar is at index: g_candleCount - 1 - InpPivotRB
+   int pivotBar = g_candleCount - 1 - InpPivotRB;
+   if(pivotBar < InpPivotLB) return;
+
+   //--- Check if this bar is a pivot high
+   if(IsPivotHigh(pivotBar))
+   {
+      g_lastHighPrice = g_candles[pivotBar].high;
+      g_lastHighTime  = g_candles[pivotBar].openTime;
+      g_lastHighBar   = pivotBar;
+      Print("[BoS_ChoCh_Trader] New Pivot HIGH confirmed at ", g_lastHighPrice,
+            " bar=", pivotBar);
+   }
+
+   //--- Check if this bar is a pivot low
+   if(IsPivotLow(pivotBar))
+   {
+      g_lastLowPrice = g_candles[pivotBar].low;
+      g_lastLowTime  = g_candles[pivotBar].openTime;
+      g_lastLowBar   = pivotBar;
+      Print("[BoS_ChoCh_Trader] New Pivot LOW confirmed at ", g_lastLowPrice,
+            " bar=", pivotBar);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for break of structure on current price (every tick)         |
+//+------------------------------------------------------------------+
+void CheckBreak()
+{
+   int lastBar = g_candleCount - 1;
+   if(lastBar < 1) return;
+
+   double currentClose = g_candles[lastBar].close;
+
+   //--- Check bullish break (close above last swing high)
+   if(g_lastHighBar >= 0 && lastBar > g_lastHighBar && currentClose > g_lastHighPrice)
+   {
+      string lbl = (g_trend == -1) ? "ChoCh" : "BoS";
+      bool canTrade = (g_trend == -1) ? InpTradeChoCh : InpTradeBOS;
+      g_trend = 1;
+
+      if(canTrade && lastBar != g_lastSignalBar)
+      {
+         g_lastSignalBar = lastBar;
+
+         //--- SL = low of the swing structure (the last pivot low)
+         double slPrice = g_lastLowPrice;
+         if(slPrice >= DBL_MAX || slPrice <= 0)
+            slPrice = g_candles[g_lastHighBar].low;
+
+         Print("[BoS_ChoCh_Trader] BULLISH ", lbl, " detected! Price=", currentClose,
+               " broke above ", g_lastHighPrice, " | SL=", slPrice);
+         ExecuteBuy(slPrice, lbl);
+
+         if(InpDrawSignals)
+            DrawSignal(g_lastHighPrice, g_lastHighTime,
+                      g_candles[lastBar].openTime, InpBullColor, true, lbl);
+      }
+
+      g_lastHighBar   = -1;
+      g_lastHighPrice = 0;
+   }
+
+   //--- Check bearish break (close below last swing low)
+   if(g_lastLowBar >= 0 && lastBar > g_lastLowBar && currentClose < g_lastLowPrice)
+   {
+      string lbl = (g_trend == 1) ? "ChoCh" : "BoS";
+      bool canTrade = (g_trend == 1) ? InpTradeChoCh : InpTradeBOS;
+      g_trend = -1;
+
+      if(canTrade && lastBar != g_lastSignalBar)
+      {
+         g_lastSignalBar = lastBar;
+
+         //--- SL = high of the swing structure (the last pivot high)
+         double slPrice = g_lastHighPrice;
+         if(slPrice <= 0)
+            slPrice = g_candles[g_lastLowBar].high;
+
+         Print("[BoS_ChoCh_Trader] BEARISH ", lbl, " detected! Price=", currentClose,
+               " broke below ", g_lastLowPrice, " | SL=", slPrice);
+         ExecuteSell(slPrice, lbl);
+
+         if(InpDrawSignals)
+            DrawSignal(g_lastLowPrice, g_lastLowTime,
+                      g_candles[lastBar].openTime, InpBearColor, false, lbl);
+      }
+
+      g_lastLowBar   = -1;
+      g_lastLowPrice = DBL_MAX;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check structure on the last closed candle (seconds mode) - LEGACY  |
 //+------------------------------------------------------------------+
 void CheckStructure()
 {
-   if(g_candleCount < InpPivotLB + InpPivotRB + 5) return;
-
-   //--- Check for pivot on the candle that just confirmed (RB bars back)
-   int checkBar = g_candleCount - 1 - InpPivotRB;
-   if(checkBar < InpPivotLB) return;
-
-   //--- Check pivot high
-   if(IsPivotHigh(checkBar))
-   {
-      g_lastHighPrice = g_candles[checkBar].high;
-      g_lastHighTime  = g_candles[checkBar].openTime;
-      g_lastHighBar   = checkBar;
-   }
-
-   //--- Check pivot low
-   if(IsPivotLow(checkBar))
-   {
-      g_lastLowPrice = g_candles[checkBar].low;
-      g_lastLowTime  = g_candles[checkBar].openTime;
-      g_lastLowBar   = checkBar;
-   }
-
-   //--- Check break of last swing high (bullish)
-   int lastBar = g_candleCount - 1;
-   if(g_lastHighBar >= 0 && lastBar > g_lastHighBar)
-   {
-      if(g_candles[lastBar].close > g_lastHighPrice)
-      {
-         string lbl = (g_trend == -1) ? "ChoCh" : "BoS";
-         bool canTrade = (g_trend == -1) ? InpTradeChoCh : InpTradeBOS;
-         g_trend = 1;
-
-         if(canTrade && lastBar != g_lastSignalBar)
-         {
-            g_lastSignalBar = lastBar;
-
-            //--- SL = low of the swing structure (the pivot low before the break)
-            double slPrice = g_lastLowPrice;
-            if(slPrice >= DBL_MAX || slPrice <= 0)
-               slPrice = g_candles[g_lastHighBar].low;
-
-            ExecuteBuy(slPrice, lbl);
-
-            if(InpDrawSignals)
-               DrawSignal(g_lastHighPrice, g_lastHighTime,
-                         g_candles[lastBar].openTime, InpBullColor, true, lbl);
-         }
-
-         g_lastHighBar   = -1;
-         g_lastHighPrice = 0;
-      }
-   }
-
-   //--- Check break of last swing low (bearish)
-   if(g_lastLowBar >= 0 && lastBar > g_lastLowBar)
-   {
-      if(g_candles[lastBar].close < g_lastLowPrice)
-      {
-         string lbl = (g_trend == 1) ? "ChoCh" : "BoS";
-         bool canTrade = (g_trend == 1) ? InpTradeChoCh : InpTradeBOS;
-         g_trend = -1;
-
-         if(canTrade && lastBar != g_lastSignalBar)
-         {
-            g_lastSignalBar = lastBar;
-
-            //--- SL = high of the swing structure (the pivot high before the break)
-            double slPrice = g_lastHighPrice;
-            if(slPrice <= 0)
-               slPrice = g_candles[g_lastLowBar].high;
-
-            ExecuteSell(slPrice, lbl);
-
-            if(InpDrawSignals)
-               DrawSignal(g_lastLowPrice, g_lastLowTime,
-                         g_candles[lastBar].openTime, InpBearColor, false, lbl);
-         }
-
-         g_lastLowBar   = -1;
-         g_lastLowPrice = DBL_MAX;
-      }
-   }
+   // Now handled by ScanForNewPivots() + CheckBreak()
+   return;
 }
 
 //+------------------------------------------------------------------+

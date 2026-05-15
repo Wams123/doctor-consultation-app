@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                           SecondsChartEA.mq5      |
-//|                     Custom Seconds Chart with Loading Animation    |
-//|                     Opens a new window with N-second candles       |
+//|                  Opens a TRUE 5-Second Custom Symbol Chart         |
+//|                  Uses CustomSymbol + CustomRatesUpdate             |
 //+------------------------------------------------------------------+
-#property copyright "SecondsChartEA"
+#property copyright "SecondsChartEA v3"
 #property link      ""
-#property version   "2.00"
+#property version   "3.00"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -13,41 +13,33 @@
 //+------------------------------------------------------------------+
 input int      InpSeconds          = 5;             // Chart Seconds Timeframe
 input int      InpLoadTimeMs       = 5500;          // Loading Time (ms) 5-6 sec
-input int      InpMaxCandles       = 150;           // Max Candles to Display
+input int      InpMaxBars          = 500;           // Max Bars to Build
 input color    InpProgressColor    = clrDeepSkyBlue;// Progress Bar Fill Color
 input color    InpProgressBgColor  = clrSlateGray;  // Progress Bar Background
 input color    InpLoadTextColor    = clrWhite;      // Loading Text Color
 input color    InpBullCandle       = clrLime;       // Bullish Candle Color
 input color    InpBearCandle       = clrOrangeRed;  // Bearish Candle Color
 input color    InpChartBgColor     = C'20,20,30';   // Chart Background Color
-input bool     InpShowSpread       = true;          // Show Spread on Chart
-input bool     InpShowTickCounter  = true;          // Show Tick Counter
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                   |
 //+------------------------------------------------------------------+
-string   PREFIX           = "SEC_";
-long     g_chartId        = 0;
-bool     g_isLoading      = true;
-bool     g_chartReady     = false;
-int      g_progress       = 0;
-uint     g_startTick      = 0;
-int      g_tickCount      = 0;
-int      g_candleObjCount = 0;
+string   PREFIX              = "SEC_";
+string   g_customSymbol      = "";
+long     g_chartId           = 0;
+bool     g_isLoading         = true;
+bool     g_chartReady        = false;
+int      g_progress          = 0;
+uint     g_startTick         = 0;
+bool     g_symbolCreated     = false;
 
-// Custom candle data storage
-struct SecondCandle
-{
-   datetime openTime;
-   double   open;
-   double   high;
-   double   low;
-   double   close;
-   long     volume;
-};
-
-SecondCandle g_candles[];
-datetime     g_lastCandleTime = 0;
+// Live candle building
+datetime g_currentBarTime    = 0;
+double   g_currentOpen       = 0;
+double   g_currentHigh       = 0;
+double   g_currentLow        = 0;
+double   g_currentClose      = 0;
+long     g_currentVolume     = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -59,19 +51,18 @@ int OnInit()
    g_chartReady   = false;
    g_progress     = 0;
    g_chartId      = 0;
-   g_tickCount    = 0;
-   g_candleObjCount = 0;
-   g_lastCandleTime = 0;
-   ArrayResize(g_candles, 0);
+   g_currentBarTime = 0;
 
-   //--- Draw loading screen
+   //--- Build custom symbol name (e.g., "EURUSD_5s")
+   g_customSymbol = Symbol() + "_" + IntegerToString(InpSeconds) + "s";
+
+   //--- Draw loading screen on current chart
    DrawLoadingScreen();
 
    //--- Timer at 50ms for smooth loading animation
    EventSetMillisecondTimer(50);
 
-   Print("[SecondsChartEA] Starting... Will open ", InpSeconds, "s chart in ~",
-         InpLoadTimeMs/1000, " seconds.");
+   Print("[SecondsChartEA] Initializing ", InpSeconds, "s chart for ", Symbol());
    return(INIT_SUCCEEDED);
 }
 
@@ -83,21 +74,26 @@ void OnDeinit(const int reason)
    EventKillTimer();
    RemoveAllObjects(0);
 
+   //--- Close custom chart
    if(g_chartId > 0)
    {
-      RemoveAllObjects(g_chartId);
       ChartClose(g_chartId);
       g_chartId = 0;
    }
 
-   ArrayFree(g_candles);
-   Print("[SecondsChartEA] Removed.");
+   //--- Delete custom symbol
+   if(g_symbolCreated)
+   {
+      CustomSymbolDelete(g_customSymbol);
+      g_symbolCreated = false;
+      Print("[SecondsChartEA] Custom symbol ", g_customSymbol, " deleted.");
+   }
+
+   Print("[SecondsChartEA] Deinitialized.");
 }
 
-
-
 //+------------------------------------------------------------------+
-//| Timer handler - loading animation + candle refresh                 |
+//| Timer handler                                                       |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
@@ -114,94 +110,337 @@ void OnTimer()
          RemoveAllObjects(0);
          ChartRedraw(0);
 
-         //--- Open custom seconds chart
-         OpenSecondsChart();
+         //--- Create custom symbol and open chart
+         if(CreateCustomSymbolChart())
+         {
+            g_chartReady = true;
+            Print("[SecondsChartEA] ", InpSeconds, "s chart ready!");
+         }
 
-         //--- Switch to candle-building timer
+         //--- Switch timer to feed data every second
          EventKillTimer();
-         EventSetMillisecondTimer(InpSeconds * 1000);
-
-         Print("[SecondsChartEA] Loading complete! Chart opened.");
+         EventSetMillisecondTimer(1000);
       }
    }
    else
    {
-      //--- Periodic refresh of custom chart
-      if(g_chartReady && g_chartId > 0)
-         RedrawCandlesOnChart();
+      //--- Feed live data to custom symbol every second
+      if(g_chartReady)
+         FeedLiveData();
    }
 }
 
 //+------------------------------------------------------------------+
-//| Tick handler - builds real-time second candles                     |
+//| Tick handler                                                        |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   g_tickCount++;
-
-   if(g_isLoading || !g_chartReady || g_chartId <= 0)
+   if(!g_chartReady || !g_symbolCreated)
       return;
 
-   //--- Get current price
+   FeedLiveData();
+}
+
+//+------------------------------------------------------------------+
+//| Create custom symbol and open its chart                            |
+//+------------------------------------------------------------------+
+bool CreateCustomSymbolChart()
+{
+   //--- Step 1: Create custom symbol
+   if(!CustomSymbolCreate(g_customSymbol, "Custom\\" + g_customSymbol, Symbol()))
+   {
+      //--- Maybe already exists, try to use it
+      if(GetLastError() != 5300) // ERR_CUSTOM_SYMBOL_EXIST
+      {
+         // Try deleting and recreating
+         CustomSymbolDelete(g_customSymbol);
+         if(!CustomSymbolCreate(g_customSymbol, "Custom\\" + g_customSymbol, Symbol()))
+         {
+            Print("[SecondsChartEA] ERROR: Cannot create custom symbol! Error=", GetLastError());
+            return false;
+         }
+      }
+   }
+   g_symbolCreated = true;
+
+   //--- Step 2: Copy symbol properties from parent
+   CustomSymbolSetInteger(g_customSymbol, SYMBOL_DIGITS, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS));
+   CustomSymbolSetDouble(g_customSymbol, SYMBOL_POINT, SymbolInfoDouble(Symbol(), SYMBOL_POINT));
+   CustomSymbolSetDouble(g_customSymbol, SYMBOL_TRADE_TICK_SIZE, SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE));
+   CustomSymbolSetDouble(g_customSymbol, SYMBOL_TRADE_TICK_VALUE, SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE));
+   CustomSymbolSetDouble(g_customSymbol, SYMBOL_VOLUME_MIN, SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN));
+   CustomSymbolSetString(g_customSymbol, SYMBOL_DESCRIPTION, Symbol() + " " + IntegerToString(InpSeconds) + " Seconds");
+   CustomSymbolSetString(g_customSymbol, SYMBOL_CURRENCY_BASE, SymbolInfoString(Symbol(), SYMBOL_CURRENCY_BASE));
+   CustomSymbolSetString(g_customSymbol, SYMBOL_CURRENCY_PROFIT, SymbolInfoString(Symbol(), SYMBOL_CURRENCY_PROFIT));
+
+   //--- Step 3: Build historical N-second bars from ticks
+   BuildHistoricalBars();
+
+   //--- Step 4: Select symbol in Market Watch (required to open chart)
+   SymbolSelect(g_customSymbol, true);
+
+   //--- Step 5: Open chart with M1 (we feed custom rates so each M1 bar = our N seconds)
+   //--- Actually open on the custom symbol itself
+   g_chartId = ChartOpen(g_customSymbol, PERIOD_M1);
+
+   if(g_chartId <= 0)
+   {
+      Print("[SecondsChartEA] ERROR: Failed to open chart for ", g_customSymbol, "! Error=", GetLastError());
+      return false;
+   }
+
+   //--- Step 6: Configure chart appearance
+   ChartSetInteger(g_chartId, CHART_MODE, CHART_CANDLES);
+   ChartSetInteger(g_chartId, CHART_SHOW_GRID, false);
+   ChartSetInteger(g_chartId, CHART_SHOW_PERIOD_SEP, true);
+   ChartSetInteger(g_chartId, CHART_AUTOSCROLL, true);
+   ChartSetInteger(g_chartId, CHART_SHIFT, true);
+   ChartSetInteger(g_chartId, CHART_COLOR_BACKGROUND, InpChartBgColor);
+   ChartSetInteger(g_chartId, CHART_COLOR_FOREGROUND, clrWhite);
+   ChartSetInteger(g_chartId, CHART_COLOR_CANDLE_BULL, InpBullCandle);
+   ChartSetInteger(g_chartId, CHART_COLOR_CANDLE_BEAR, InpBearCandle);
+   ChartSetInteger(g_chartId, CHART_COLOR_CHART_UP, InpBullCandle);
+   ChartSetInteger(g_chartId, CHART_COLOR_CHART_DOWN, InpBearCandle);
+   ChartSetInteger(g_chartId, CHART_COLOR_GRID, C'40,40,50');
+   ChartSetInteger(g_chartId, CHART_SHOW_VOLUMES, false);
+
+   //--- Add header label
+   string hdr = PREFIX + "HDR";
+   ObjectCreate(g_chartId, hdr, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(g_chartId, hdr, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(g_chartId, hdr, OBJPROP_YDISTANCE, 15);
+   ObjectSetString(g_chartId, hdr, OBJPROP_TEXT,
+      Symbol() + "  " + IntegerToString(InpSeconds) + " SECONDS CHART");
+   ObjectSetInteger(g_chartId, hdr, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(g_chartId, hdr, OBJPROP_FONTSIZE, 12);
+   ObjectSetString(g_chartId, hdr, OBJPROP_FONT, "Segoe UI Bold");
+   ObjectSetInteger(g_chartId, hdr, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+   ChartRedraw(g_chartId);
+   Print("[SecondsChartEA] Chart opened: ", g_customSymbol, " ID=", g_chartId);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Build historical bars from tick data                                |
+//+------------------------------------------------------------------+
+void BuildHistoricalBars()
+{
+   //--- Get recent ticks from parent symbol
+   MqlTick ticks[];
+   int tickCount = CopyTicks(Symbol(), ticks, COPY_TICKS_ALL, 0, 50000);
+
+   if(tickCount <= 0)
+   {
+      Print("[SecondsChartEA] No ticks available, building from M1 rates instead.");
+      BuildFromM1Rates();
+      return;
+   }
+
+   Print("[SecondsChartEA] Building ", InpSeconds, "s bars from ", tickCount, " ticks...");
+
+   //--- Aggregate ticks into N-second bars
+   MqlRates bars[];
+   ArrayResize(bars, 0);
+
+   datetime barStart = ticks[0].time - (ticks[0].time % InpSeconds);
+   double barOpen = ticks[0].bid;
+   double barHigh = ticks[0].bid;
+   double barLow  = ticks[0].bid;
+   double barClose = ticks[0].bid;
+   long   barVol  = 1;
+
+   for(int i = 1; i < tickCount; i++)
+   {
+      datetime tickBarStart = ticks[i].time - (ticks[i].time % InpSeconds);
+
+      if(tickBarStart != barStart)
+      {
+         //--- Save completed bar
+         int sz = ArraySize(bars);
+         ArrayResize(bars, sz + 1);
+         bars[sz].time       = barStart;
+         bars[sz].open       = barOpen;
+         bars[sz].high       = barHigh;
+         bars[sz].low        = barLow;
+         bars[sz].close      = barClose;
+         bars[sz].tick_volume = barVol;
+         bars[sz].spread     = 0;
+         bars[sz].real_volume = 0;
+
+         //--- Start new bar
+         barStart = tickBarStart;
+         barOpen  = ticks[i].bid;
+         barHigh  = ticks[i].bid;
+         barLow   = ticks[i].bid;
+         barClose = ticks[i].bid;
+         barVol   = 1;
+
+         if(ArraySize(bars) >= InpMaxBars)
+            break;
+      }
+      else
+      {
+         //--- Update current bar
+         barClose = ticks[i].bid;
+         if(ticks[i].bid > barHigh) barHigh = ticks[i].bid;
+         if(ticks[i].bid < barLow)  barLow  = ticks[i].bid;
+         barVol++;
+      }
+   }
+
+   //--- Add last bar
+   if(ArraySize(bars) < InpMaxBars)
+   {
+      int sz = ArraySize(bars);
+      ArrayResize(bars, sz + 1);
+      bars[sz].time       = barStart;
+      bars[sz].open       = barOpen;
+      bars[sz].high       = barHigh;
+      bars[sz].low        = barLow;
+      bars[sz].close      = barClose;
+      bars[sz].tick_volume = barVol;
+      bars[sz].spread     = 0;
+      bars[sz].real_volume = 0;
+   }
+
+   //--- Push bars to custom symbol
+   if(ArraySize(bars) > 0)
+   {
+      int added = CustomRatesUpdate(g_customSymbol, bars);
+      Print("[SecondsChartEA] Added ", added, " bars (", InpSeconds, "s each) to ", g_customSymbol);
+   }
+
+   //--- Set initial live bar tracking
+   if(ArraySize(bars) > 0)
+   {
+      g_currentBarTime = bars[ArraySize(bars)-1].time + InpSeconds;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fallback: Build from M1 rates if no ticks available                |
+//+------------------------------------------------------------------+
+void BuildFromM1Rates()
+{
+   MqlRates m1[];
+   int copied = CopyRates(Symbol(), PERIOD_M1, 0, 200, m1);
+   if(copied <= 0) return;
+
+   int candlesPerM1 = 60 / InpSeconds;
+   MqlRates bars[];
+   ArrayResize(bars, 0);
+
+   for(int i = 0; i < copied; i++)
+   {
+      double o = m1[i].open;
+      double c = m1[i].close;
+      double h = m1[i].high;
+      double l = m1[i].low;
+      double range = h - l;
+
+      for(int j = 0; j < candlesPerM1; j++)
+      {
+         int sz = ArraySize(bars);
+         if(sz >= InpMaxBars) break;
+
+         ArrayResize(bars, sz + 1);
+
+         double pctS = (double)j / candlesPerM1;
+         double pctE = (double)(j+1) / candlesPerM1;
+
+         bars[sz].time       = m1[i].time + j * InpSeconds;
+         bars[sz].open       = o + (c - o) * pctS;
+         bars[sz].close      = o + (c - o) * pctE;
+
+         double subRange = range / candlesPerM1;
+         double noise = MathSin((j + 1.0) * M_PI / candlesPerM1) * subRange * 0.4;
+         bars[sz].high = MathMax(bars[sz].open, bars[sz].close) + MathAbs(noise);
+         bars[sz].low  = MathMin(bars[sz].open, bars[sz].close) - MathAbs(noise);
+         if(bars[sz].high > h) bars[sz].high = h;
+         if(bars[sz].low  < l) bars[sz].low  = l;
+
+         bars[sz].tick_volume = m1[i].tick_volume / candlesPerM1;
+         bars[sz].spread     = 0;
+         bars[sz].real_volume = 0;
+      }
+   }
+
+   if(ArraySize(bars) > 0)
+   {
+      int added = CustomRatesUpdate(g_customSymbol, bars);
+      Print("[SecondsChartEA] Fallback: Added ", added, " bars from M1 data.");
+      g_currentBarTime = bars[ArraySize(bars)-1].time + InpSeconds;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Feed live tick data to custom symbol as N-second bars              |
+//+------------------------------------------------------------------+
+void FeedLiveData()
+{
+   if(!g_symbolCreated) return;
+
    double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
    if(bid <= 0) return;
 
    datetime now = TimeCurrent();
-   datetime candleStart = now - (now % InpSeconds);
+   datetime barTime = now - (now % InpSeconds);
 
-   int size = ArraySize(g_candles);
+   //--- Feed tick to custom symbol (updates its bid/ask)
+   MqlTick tick;
+   tick.time     = now;
+   tick.time_msc = (long)now * 1000;
+   tick.bid      = bid;
+   tick.ask      = ask;
+   tick.last     = bid;
+   tick.volume   = 1;
+   tick.flags    = TICK_FLAG_BID | TICK_FLAG_ASK;
+   CustomTicksAdd(g_customSymbol, tick);
 
-   //--- Check if we need a new candle or update existing
-   if(size == 0 || g_candles[size-1].openTime != candleStart)
+   //--- Build/update the current N-second bar
+   if(barTime != g_currentBarTime)
    {
-      //--- New candle
-      ArrayResize(g_candles, size + 1);
-      g_candles[size].openTime = candleStart;
-      g_candles[size].open     = bid;
-      g_candles[size].high     = bid;
-      g_candles[size].low      = bid;
-      g_candles[size].close    = bid;
-      g_candles[size].volume   = 1;
-
-      //--- Trim to max candles
-      if(ArraySize(g_candles) > InpMaxCandles)
-      {
-         SecondCandle temp[];
-         int newSize = InpMaxCandles;
-         ArrayResize(temp, newSize);
-         for(int i = 0; i < newSize; i++)
-            temp[i] = g_candles[ArraySize(g_candles) - newSize + i];
-         ArrayResize(g_candles, newSize);
-         for(int i = 0; i < newSize; i++)
-            g_candles[i] = temp[i];
-         ArrayFree(temp);
-      }
+      //--- New bar started
+      g_currentBarTime = barTime;
+      g_currentOpen    = bid;
+      g_currentHigh    = bid;
+      g_currentLow     = bid;
+      g_currentClose   = bid;
+      g_currentVolume  = 1;
    }
    else
    {
-      //--- Update current candle
-      int idx = size - 1;
-      g_candles[idx].close = bid;
-      if(bid > g_candles[idx].high) g_candles[idx].high = bid;
-      if(bid < g_candles[idx].low)  g_candles[idx].low  = bid;
-      g_candles[idx].volume++;
+      //--- Update current bar
+      g_currentClose = bid;
+      if(bid > g_currentHigh) g_currentHigh = bid;
+      if(bid < g_currentLow)  g_currentLow  = bid;
+      g_currentVolume++;
    }
 
-   //--- Update live info on chart
-   UpdateLiveInfo();
+   //--- Push current bar to custom symbol rates
+   MqlRates rate[1];
+   rate[0].time        = g_currentBarTime;
+   rate[0].open        = g_currentOpen;
+   rate[0].high        = g_currentHigh;
+   rate[0].low         = g_currentLow;
+   rate[0].close       = g_currentClose;
+   rate[0].tick_volume = g_currentVolume;
+   rate[0].spread      = (int)MathRound((ask - bid) / SymbolInfoDouble(Symbol(), SYMBOL_POINT));
+   rate[0].real_volume = 0;
+   CustomRatesUpdate(g_customSymbol, rate);
 }
 
-
-
 //+------------------------------------------------------------------+
-//| LOADING SCREEN FUNCTIONS                                           |
+//| LOADING SCREEN                                                     |
 //+------------------------------------------------------------------+
 void DrawLoadingScreen()
 {
    int w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
 
-   //--- Full black overlay
+   //--- Full dark overlay
    string bg = PREFIX + "LOAD_BG";
    ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 0);
@@ -287,7 +526,6 @@ void UpdateLoadingBar(int percent)
 {
    int w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int barW = 360;
-   int barX = w/2 - barW/2;
 
    //--- Fill bar
    string barFill = PREFIX + "LOAD_BARFILL";
@@ -299,260 +537,26 @@ void UpdateLoadingBar(int percent)
    string pct = PREFIX + "LOAD_PCT";
    ObjectSetString(0, pct, OBJPROP_TEXT, IntegerToString(percent) + "%");
 
-   //--- Status text changes as loading progresses
+   //--- Dynamic status messages
    string status = PREFIX + "LOAD_STATUS";
-   if(percent < 20)
-      ObjectSetString(0, status, OBJPROP_TEXT, "Initializing tick collector...");
-   else if(percent < 40)
-      ObjectSetString(0, status, OBJPROP_TEXT, "Loading historical data...");
-   else if(percent < 60)
-      ObjectSetString(0, status, OBJPROP_TEXT, "Building " + IntegerToString(InpSeconds) + "s candle structure...");
-   else if(percent < 80)
-      ObjectSetString(0, status, OBJPROP_TEXT, "Preparing chart renderer...");
+   if(percent < 15)
+      ObjectSetString(0, status, OBJPROP_TEXT, "Creating custom symbol...");
+   else if(percent < 35)
+      ObjectSetString(0, status, OBJPROP_TEXT, "Downloading tick history...");
+   else if(percent < 55)
+      ObjectSetString(0, status, OBJPROP_TEXT, "Aggregating " + IntegerToString(InpSeconds) + "s bars...");
+   else if(percent < 75)
+      ObjectSetString(0, status, OBJPROP_TEXT, "Building chart data...");
+   else if(percent < 90)
+      ObjectSetString(0, status, OBJPROP_TEXT, "Preparing chart window...");
    else
-      ObjectSetString(0, status, OBJPROP_TEXT, "Finalizing... Opening chart window");
+      ObjectSetString(0, status, OBJPROP_TEXT, "Opening " + IntegerToString(InpSeconds) + " second chart...");
 
    ChartRedraw(0);
 }
 
-
-
 //+------------------------------------------------------------------+
-//| CHART OPEN & CONFIGURATION                                         |
-//+------------------------------------------------------------------+
-void OpenSecondsChart()
-{
-   g_chartId = ChartOpen(Symbol(), PERIOD_M1);
-
-   if(g_chartId <= 0)
-   {
-      Print("[SecondsChartEA] ERROR: Could not open chart!");
-      return;
-   }
-
-   //--- Configure chart appearance
-   ChartSetInteger(g_chartId, CHART_MODE, CHART_CANDLES);
-   ChartSetInteger(g_chartId, CHART_SHOW_GRID, false);
-   ChartSetInteger(g_chartId, CHART_SHOW_PERIOD_SEP, false);
-   ChartSetInteger(g_chartId, CHART_AUTOSCROLL, true);
-   ChartSetInteger(g_chartId, CHART_SHIFT, true);
-   ChartSetInteger(g_chartId, CHART_COLOR_BACKGROUND, InpChartBgColor);
-   ChartSetInteger(g_chartId, CHART_COLOR_FOREGROUND, clrWhite);
-   ChartSetInteger(g_chartId, CHART_COLOR_CANDLE_BULL, InpBullCandle);
-   ChartSetInteger(g_chartId, CHART_COLOR_CANDLE_BEAR, InpBearCandle);
-   ChartSetInteger(g_chartId, CHART_COLOR_CHART_UP, InpBullCandle);
-   ChartSetInteger(g_chartId, CHART_COLOR_CHART_DOWN, InpBearCandle);
-   ChartSetInteger(g_chartId, CHART_COLOR_GRID, C'40,40,50');
-   ChartSetInteger(g_chartId, CHART_SHOW_VOLUMES, false);
-   ChartSetInteger(g_chartId, CHART_SHOW_OHLC, false);
-
-   //--- Header label
-   string hdr = PREFIX + "HDR";
-   ObjectCreate(g_chartId, hdr, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_YDISTANCE, 15);
-   ObjectSetString(g_chartId, hdr, OBJPROP_TEXT,
-      Symbol() + "  " + IntegerToString(InpSeconds) + " SECONDS");
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_COLOR, clrWhite);
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_FONTSIZE, 14);
-   ObjectSetString(g_chartId, hdr, OBJPROP_FONT, "Segoe UI Bold");
-   ObjectSetInteger(g_chartId, hdr, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-
-   //--- Pre-load candles from M1 data
-   PreloadCandles();
-
-   //--- Draw initial candles
-   RedrawCandlesOnChart();
-
-   g_chartReady = true;
-   ChartRedraw(g_chartId);
-}
-
-//+------------------------------------------------------------------+
-//| Preload historical candles from M1 data                            |
-//+------------------------------------------------------------------+
-void PreloadCandles()
-{
-   MqlRates rates[];
-   int copied = CopyRates(Symbol(), PERIOD_M1, 0, 100, rates);
-   if(copied <= 0) return;
-
-   int candlesPerM1 = 60 / InpSeconds;
-   ArrayResize(g_candles, 0);
-
-   for(int i = 0; i < copied; i++)
-   {
-      double o = rates[i].open;
-      double c = rates[i].close;
-      double h = rates[i].high;
-      double l = rates[i].low;
-      double range = h - l;
-
-      for(int j = 0; j < candlesPerM1; j++)
-      {
-         int sz = ArraySize(g_candles);
-         if(sz >= InpMaxCandles) break;
-
-         ArrayResize(g_candles, sz + 1);
-
-         double pctStart = (double)j / candlesPerM1;
-         double pctEnd   = (double)(j+1) / candlesPerM1;
-
-         g_candles[sz].openTime = rates[i].time + j * InpSeconds;
-         g_candles[sz].open     = o + (c - o) * pctStart;
-         g_candles[sz].close    = o + (c - o) * pctEnd;
-
-         //--- Simulate high/low with variation
-         double mid = (g_candles[sz].open + g_candles[sz].close) / 2.0;
-         double subRange = range / candlesPerM1;
-         double noise = MathSin((j + 1.0) * M_PI / candlesPerM1) * subRange * 0.5;
-         g_candles[sz].high = MathMax(g_candles[sz].open, g_candles[sz].close) + MathAbs(noise);
-         g_candles[sz].low  = MathMin(g_candles[sz].open, g_candles[sz].close) - MathAbs(noise);
-
-         //--- Clamp within M1 bar
-         if(g_candles[sz].high > h) g_candles[sz].high = h;
-         if(g_candles[sz].low  < l) g_candles[sz].low  = l;
-
-         g_candles[sz].volume = rates[i].tick_volume / candlesPerM1;
-      }
-   }
-
-   //--- Trim to max
-   if(ArraySize(g_candles) > InpMaxCandles)
-   {
-      int excess = ArraySize(g_candles) - InpMaxCandles;
-      SecondCandle temp[];
-      ArrayResize(temp, InpMaxCandles);
-      for(int i = 0; i < InpMaxCandles; i++)
-         temp[i] = g_candles[excess + i];
-      ArrayResize(g_candles, InpMaxCandles);
-      for(int i = 0; i < InpMaxCandles; i++)
-         g_candles[i] = temp[i];
-      ArrayFree(temp);
-   }
-}
-
-
-
-//+------------------------------------------------------------------+
-//| Draw all candles on the custom chart                                |
-//+------------------------------------------------------------------+
-void RedrawCandlesOnChart()
-{
-   if(g_chartId <= 0) return;
-
-   //--- Remove old candle objects
-   int total = ObjectsTotal(g_chartId, 0, -1);
-   for(int i = total - 1; i >= 0; i--)
-   {
-      string name = ObjectName(g_chartId, i);
-      if(StringFind(name, PREFIX + "C_") == 0)
-         ObjectDelete(g_chartId, name);
-   }
-
-   int size = ArraySize(g_candles);
-   if(size == 0) return;
-
-   g_candleObjCount = 0;
-
-   for(int i = 0; i < size; i++)
-   {
-      color clr = (g_candles[i].close >= g_candles[i].open) ? InpBullCandle : InpBearCandle;
-      datetime t1 = g_candles[i].openTime;
-      datetime t2 = t1 + InpSeconds - 1;
-
-      //--- Wick line (high to low)
-      string wName = PREFIX + "C_W" + IntegerToString(g_candleObjCount);
-      ObjectCreate(g_chartId, wName, OBJ_TREND, 0, t1, g_candles[i].high, t1, g_candles[i].low);
-      ObjectSetInteger(g_chartId, wName, OBJPROP_COLOR, clr);
-      ObjectSetInteger(g_chartId, wName, OBJPROP_WIDTH, 1);
-      ObjectSetInteger(g_chartId, wName, OBJPROP_RAY_RIGHT, false);
-      ObjectSetInteger(g_chartId, wName, OBJPROP_BACK, true);
-      ObjectSetInteger(g_chartId, wName, OBJPROP_SELECTABLE, false);
-
-      //--- Body rectangle (open to close)
-      string bName = PREFIX + "C_B" + IntegerToString(g_candleObjCount);
-      ObjectCreate(g_chartId, bName, OBJ_RECTANGLE, 0, t1, g_candles[i].open, t2, g_candles[i].close);
-      ObjectSetInteger(g_chartId, bName, OBJPROP_COLOR, clr);
-      ObjectSetInteger(g_chartId, bName, OBJPROP_FILL, true);
-      ObjectSetInteger(g_chartId, bName, OBJPROP_BACK, true);
-      ObjectSetInteger(g_chartId, bName, OBJPROP_SELECTABLE, false);
-
-      g_candleObjCount++;
-   }
-
-   ChartRedraw(g_chartId);
-}
-
-//+------------------------------------------------------------------+
-//| Update live information panel on chart                              |
-//+------------------------------------------------------------------+
-void UpdateLiveInfo()
-{
-   if(g_chartId <= 0) return;
-
-   double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
-   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
-   int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
-   double spread = (ask - bid) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-
-   //--- Price label
-   string priceLabel = PREFIX + "PRICE";
-   if(ObjectFind(g_chartId, priceLabel) < 0)
-   {
-      ObjectCreate(g_chartId, priceLabel, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(g_chartId, priceLabel, OBJPROP_XDISTANCE, 15);
-      ObjectSetInteger(g_chartId, priceLabel, OBJPROP_YDISTANCE, 40);
-      ObjectSetInteger(g_chartId, priceLabel, OBJPROP_FONTSIZE, 11);
-      ObjectSetString(g_chartId, priceLabel, OBJPROP_FONT, "Segoe UI");
-      ObjectSetInteger(g_chartId, priceLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   }
-   color priceClr = (bid >= ask) ? InpBullCandle : InpBearCandle;
-   ObjectSetInteger(g_chartId, priceLabel, OBJPROP_COLOR, priceClr);
-   ObjectSetString(g_chartId, priceLabel, OBJPROP_TEXT,
-      "Bid: " + DoubleToString(bid, digits) + "  Ask: " + DoubleToString(ask, digits));
-
-   //--- Spread
-   if(InpShowSpread)
-   {
-      string spreadLabel = PREFIX + "SPREAD";
-      if(ObjectFind(g_chartId, spreadLabel) < 0)
-      {
-         ObjectCreate(g_chartId, spreadLabel, OBJ_LABEL, 0, 0, 0);
-         ObjectSetInteger(g_chartId, spreadLabel, OBJPROP_XDISTANCE, 15);
-         ObjectSetInteger(g_chartId, spreadLabel, OBJPROP_YDISTANCE, 58);
-         ObjectSetInteger(g_chartId, spreadLabel, OBJPROP_FONTSIZE, 9);
-         ObjectSetString(g_chartId, spreadLabel, OBJPROP_FONT, "Segoe UI");
-         ObjectSetInteger(g_chartId, spreadLabel, OBJPROP_COLOR, clrGray);
-         ObjectSetInteger(g_chartId, spreadLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      }
-      ObjectSetString(g_chartId, spreadLabel, OBJPROP_TEXT,
-         "Spread: " + DoubleToString(spread, 1) + " pts | Candles: " + IntegerToString(ArraySize(g_candles)));
-   }
-
-   //--- Tick counter
-   if(InpShowTickCounter)
-   {
-      string tickLabel = PREFIX + "TICKS";
-      if(ObjectFind(g_chartId, tickLabel) < 0)
-      {
-         ObjectCreate(g_chartId, tickLabel, OBJ_LABEL, 0, 0, 0);
-         ObjectSetInteger(g_chartId, tickLabel, OBJPROP_XDISTANCE, 15);
-         ObjectSetInteger(g_chartId, tickLabel, OBJPROP_YDISTANCE, 74);
-         ObjectSetInteger(g_chartId, tickLabel, OBJPROP_FONTSIZE, 9);
-         ObjectSetString(g_chartId, tickLabel, OBJPROP_FONT, "Segoe UI");
-         ObjectSetInteger(g_chartId, tickLabel, OBJPROP_COLOR, clrYellow);
-         ObjectSetInteger(g_chartId, tickLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      }
-      ObjectSetString(g_chartId, tickLabel, OBJPROP_TEXT,
-         "Ticks: " + IntegerToString(g_tickCount) + " | " + TimeToString(TimeCurrent(), TIME_SECONDS));
-   }
-
-   ChartRedraw(g_chartId);
-}
-
-//+------------------------------------------------------------------+
-//| Remove all objects with our prefix from a chart                    |
+//| Remove all objects with our prefix                                 |
 //+------------------------------------------------------------------+
 void RemoveAllObjects(long chartId)
 {

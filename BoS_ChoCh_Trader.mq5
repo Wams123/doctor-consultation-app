@@ -9,6 +9,8 @@
 #property version     "1.00"
 #property strict
 
+#include <Trade\Trade.mqh>
+
 //+------------------------------------------------------------------+
 //| INPUT PARAMETERS                                                   |
 //+------------------------------------------------------------------+
@@ -248,7 +250,10 @@ void CheckBreak()
    if(g_lastHighBar >= 0 && lastBar > g_lastHighBar && currentClose > g_lastHighPrice)
    {
       string lbl = (g_trend == -1) ? "ChoCh" : "BoS";
-      bool canTrade = (g_trend == -1) ? InpTradeChoCh : InpTradeBOS;
+      bool canTrade = true;  // Always trade - filter by type below
+      if(g_trend == -1) canTrade = InpTradeChoCh;
+      else if(g_trend == 1) canTrade = InpTradeBOS;
+      else canTrade = InpTradeBOS;  // g_trend==0: first break, treat as BoS
       g_trend = 1;
 
       if(canTrade && lastBar != g_lastSignalBar)
@@ -277,7 +282,10 @@ void CheckBreak()
    if(g_lastLowBar >= 0 && lastBar > g_lastLowBar && currentClose < g_lastLowPrice)
    {
       string lbl = (g_trend == 1) ? "ChoCh" : "BoS";
-      bool canTrade = (g_trend == 1) ? InpTradeChoCh : InpTradeBOS;
+      bool canTrade = true;  // Always trade - filter by type below
+      if(g_trend == 1) canTrade = InpTradeChoCh;
+      else if(g_trend == -1) canTrade = InpTradeBOS;
+      else canTrade = InpTradeBOS;  // g_trend==0: first break, treat as BoS
       g_trend = -1;
 
       if(canTrade && lastBar != g_lastSignalBar)
@@ -432,7 +440,7 @@ void ExecuteBuy(double slPrice, string comment)
 
    //--- SL must be below entry
    if(slPrice >= ask)
-      slPrice = ask - 50 * point;  // Fallback: 50 points SL
+      slPrice = ask - 50 * point;
 
    double slDistance = ask - slPrice;
    if(slDistance <= 0) return;
@@ -448,26 +456,16 @@ void ExecuteBuy(double slPrice, string comment)
 
    double sl = NormalizeDouble(slPrice, digits);
 
-   MqlTradeRequest request = {};
-   MqlTradeResult  result  = {};
+   CTrade trade;
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
 
-   request.action    = TRADE_ACTION_DEAL;
-   request.symbol    = Symbol();
-   request.volume    = lots;
-   request.type      = ORDER_TYPE_BUY;
-   request.price     = NormalizeDouble(ask, digits);
-   request.sl        = sl;
-   request.tp        = tp;
-   request.deviation = InpSlippage;
-   request.magic     = InpMagic;
-   request.comment   = "SMC_" + comment;
-
-   if(OrderSend(request, result))
+   if(trade.Buy(lots, Symbol(), 0, sl, tp, "SMC_" + comment))
       Print("[BoS_ChoCh_Trader] BUY ", comment, " | Lots=", lots,
-            " | Entry=", ask, " | SL=", sl, " | TP=", tp);
+            " | SL=", sl, " | TP=", tp);
    else
       Print("[BoS_ChoCh_Trader] BUY FAILED! Error=", GetLastError(),
-            " RetCode=", result.retcode);
+            " RetCode=", trade.ResultRetcode(), " Desc=", trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+
@@ -487,7 +485,7 @@ void ExecuteSell(double slPrice, string comment)
 
    //--- SL must be above entry
    if(slPrice <= bid)
-      slPrice = bid + 50 * point;  // Fallback: 50 points SL
+      slPrice = bid + 50 * point;
 
    double slDistance = slPrice - bid;
    if(slDistance <= 0) return;
@@ -503,26 +501,16 @@ void ExecuteSell(double slPrice, string comment)
 
    double sl = NormalizeDouble(slPrice, digits);
 
-   MqlTradeRequest request = {};
-   MqlTradeResult  result  = {};
+   CTrade trade;
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
 
-   request.action    = TRADE_ACTION_DEAL;
-   request.symbol    = Symbol();
-   request.volume    = lots;
-   request.type      = ORDER_TYPE_SELL;
-   request.price     = NormalizeDouble(bid, digits);
-   request.sl        = sl;
-   request.tp        = tp;
-   request.deviation = InpSlippage;
-   request.magic     = InpMagic;
-   request.comment   = "SMC_" + comment;
-
-   if(OrderSend(request, result))
+   if(trade.Sell(lots, Symbol(), 0, sl, tp, "SMC_" + comment))
       Print("[BoS_ChoCh_Trader] SELL ", comment, " | Lots=", lots,
-            " | Entry=", bid, " | SL=", sl, " | TP=", tp);
+            " | SL=", sl, " | TP=", tp);
    else
       Print("[BoS_ChoCh_Trader] SELL FAILED! Error=", GetLastError(),
-            " RetCode=", result.retcode);
+            " RetCode=", trade.ResultRetcode(), " Desc=", trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+

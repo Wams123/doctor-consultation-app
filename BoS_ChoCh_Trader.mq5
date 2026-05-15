@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                          BoS_ChoCh_Trader.mq5    |
 //|         SMC BOS/ChoCh Trader - 5 Second Entry EA                 |
-//|         GUARANTEED EXECUTION VERSION                              |
+//|         WITH DASHBOARD: Buy Only / Sell Only / Stop               |
 //+------------------------------------------------------------------+
 #property copyright   "SMC Trader EA"
-#property version     "2.00"
+#property version     "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -21,6 +21,18 @@ input int      InpSeconds     = 5;          // Candle seconds
 input int      InpMagic       = 55555;      // Magic Number
 input color    InpBullColor   = clrLime;    // Bull color
 input color    InpBearColor   = clrRed;     // Bear color
+
+//--- Dashboard button names
+#define BTN_BUY_ONLY   "BST_BTN_BUY"
+#define BTN_SELL_ONLY  "BST_BTN_SELL"
+#define BTN_STOP       "BST_BTN_STOP"
+#define BTN_ALL        "BST_BTN_ALL"
+#define LBL_STATUS     "BST_LBL_STATUS"
+#define LBL_TITLE      "BST_LBL_TITLE"
+#define LBL_INFO       "BST_LBL_INFO"
+
+//--- Trade mode: 0=ALL, 1=BUY ONLY, 2=SELL ONLY, 3=STOPPED
+int g_tradeMode = 0;
 
 //--- Candle struct
 struct Bar { datetime t; double o,h,l,c; };
@@ -47,13 +59,17 @@ int OnInit()
    g_swingHi = 0; g_swingHiBar = -1;
    g_swingLo = DBL_MAX; g_swingLoBar = -1;
    g_lastTrade = 0; g_objN = 0;
+   g_tradeMode = 0;
    ArrayResize(g_bars, 0);
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(20);
 
+   //--- Create dashboard
+   CreateDashboard();
+
    EventSetMillisecondTimer(100);
-   Print("=== BoS_ChoCh_Trader v2 STARTED === AutoTrade=",
+   Print("=== BoS_ChoCh_Trader v3 STARTED === AutoTrade=",
          TerminalInfoInteger(TERMINAL_TRADE_ALLOWED),
          " MQL=", MQLInfoInteger(MQL_TRADE_ALLOWED));
    return INIT_SUCCEEDED;
@@ -68,6 +84,142 @@ void OnDeinit(const int r)
 //+------------------------------------------------------------------+
 void OnTimer() { Run(); }
 void OnTick()  { Run(); }
+
+//+------------------------------------------------------------------+
+//| CHART EVENT - Handle button clicks                                 |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == BTN_BUY_ONLY)
+      {
+         g_tradeMode = 1;
+         Print("[TRADER] Mode: BUY ONLY");
+         UpdateDashboard();
+         ObjectSetInteger(0, BTN_BUY_ONLY, OBJPROP_STATE, false);
+      }
+      else if(sparam == BTN_SELL_ONLY)
+      {
+         g_tradeMode = 2;
+         Print("[TRADER] Mode: SELL ONLY");
+         UpdateDashboard();
+         ObjectSetInteger(0, BTN_SELL_ONLY, OBJPROP_STATE, false);
+      }
+      else if(sparam == BTN_STOP)
+      {
+         g_tradeMode = 3;
+         Print("[TRADER] Mode: STOPPED");
+         UpdateDashboard();
+         ObjectSetInteger(0, BTN_STOP, OBJPROP_STATE, false);
+      }
+      else if(sparam == BTN_ALL)
+      {
+         g_tradeMode = 0;
+         Print("[TRADER] Mode: BUY + SELL (ALL)");
+         UpdateDashboard();
+         ObjectSetInteger(0, BTN_ALL, OBJPROP_STATE, false);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CREATE DASHBOARD                                                   |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+   int x = 10, y = 20;
+
+   //--- Title
+   ObjectCreate(0, LBL_TITLE, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, LBL_TITLE, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, LBL_TITLE, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, LBL_TITLE, OBJPROP_TEXT, "SMC TRADER v3");
+   ObjectSetInteger(0, LBL_TITLE, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, LBL_TITLE, OBJPROP_FONTSIZE, 10);
+   ObjectSetString(0, LBL_TITLE, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, LBL_TITLE, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+   y += 22;
+
+   //--- Status label
+   ObjectCreate(0, LBL_STATUS, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, LBL_STATUS, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, LBL_STATUS, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, LBL_STATUS, OBJPROP_TEXT, "Mode: BUY + SELL");
+   ObjectSetInteger(0, LBL_STATUS, OBJPROP_COLOR, clrLime);
+   ObjectSetInteger(0, LBL_STATUS, OBJPROP_FONTSIZE, 9);
+   ObjectSetString(0, LBL_STATUS, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, LBL_STATUS, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+   y += 22;
+
+   //--- Info label
+   ObjectCreate(0, LBL_INFO, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, LBL_INFO, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, LBL_INFO, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, LBL_INFO, OBJPROP_TEXT, IntegerToString(InpSeconds)+"s | Risk "+DoubleToString(InpRiskPercent,1)+"% | RR 1:"+DoubleToString(InpRR,1));
+   ObjectSetInteger(0, LBL_INFO, OBJPROP_COLOR, clrGray);
+   ObjectSetInteger(0, LBL_INFO, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, LBL_INFO, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, LBL_INFO, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+   y += 25;
+
+   //--- BUY + SELL button (ALL)
+   CreateButton(BTN_ALL, x, y, 130, 25, "BUY + SELL", clrWhite, clrDarkGreen);
+   y += 30;
+
+   //--- BUY ONLY button
+   CreateButton(BTN_BUY_ONLY, x, y, 130, 25, "BUY ONLY", clrWhite, clrBlue);
+   y += 30;
+
+   //--- SELL ONLY button
+   CreateButton(BTN_SELL_ONLY, x, y, 130, 25, "SELL ONLY", clrWhite, clrMaroon);
+   y += 30;
+
+   //--- STOP button
+   CreateButton(BTN_STOP, x, y, 130, 25, "STOP TRADING", clrWhite, clrRed);
+
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+void CreateButton(string name, int x, int y, int w, int h, string text, color txtClr, color bgClr)
+{
+   ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, txtClr);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgClr);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrGray);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+   string modeText = "";
+   color  modeClr  = clrWhite;
+
+   switch(g_tradeMode)
+   {
+      case 0: modeText = "Mode: BUY + SELL";  modeClr = clrLime;   break;
+      case 1: modeText = "Mode: BUY ONLY";    modeClr = clrDeepSkyBlue; break;
+      case 2: modeText = "Mode: SELL ONLY";   modeClr = clrOrangeRed;   break;
+      case 3: modeText = "Mode: STOPPED";     modeClr = clrRed;    break;
+   }
+
+   ObjectSetString(0, LBL_STATUS, OBJPROP_TEXT, modeText);
+   ObjectSetInteger(0, LBL_STATUS, OBJPROP_COLOR, modeClr);
+   ChartRedraw(0);
+}
 
 //+------------------------------------------------------------------+
 void Run()
@@ -111,7 +263,6 @@ void ScanPivot()
    int pb = g_count - 1 - InpPivotRB;
    if(pb < InpPivotLB) return;
 
-   // Pivot High
    bool isHi = true;
    for(int j = pb - InpPivotLB; j <= pb + InpPivotRB; j++)
       if(j != pb && j >= 0 && j < g_count && g_bars[j].h >= g_bars[pb].h)
@@ -123,7 +274,6 @@ void ScanPivot()
       g_swingHiBar = pb;
    }
 
-   // Pivot Low
    bool isLo = true;
    for(int j = pb - InpPivotLB; j <= pb + InpPivotRB; j++)
       if(j != pb && j >= 0 && j < g_count && g_bars[j].l <= g_bars[pb].l)
@@ -148,14 +298,18 @@ void CheckBreak()
    {
       string lbl = (g_trend == -1) ? "ChoCh" : "BoS";
       bool ok = (g_trend == -1) ? InpTradeChoCh : InpTradeBOS;
-      if(g_trend == 0) ok = true; // first signal always trade
+      if(g_trend == 0) ok = true;
       g_trend = 1;
 
       if(ok && (now - g_lastTrade) > InpSeconds)
       {
          g_lastTrade = now;
          double sl = (g_swingLo < DBL_MAX && g_swingLo > 0) ? g_swingLo : g_bars[g_swingHiBar].l;
-         DoBuy(sl, lbl);
+
+         //--- Check dashboard mode
+         if(g_tradeMode == 0 || g_tradeMode == 1)  // ALL or BUY ONLY
+            DoBuy(sl, lbl);
+
          DrawLine(g_swingHi, g_swingHiTime, g_bars[last].t, InpBullColor, lbl, true);
       }
       g_swingHiBar = -1; g_swingHi = 0;
@@ -173,7 +327,11 @@ void CheckBreak()
       {
          g_lastTrade = now;
          double sl = (g_swingHi > 0) ? g_swingHi : g_bars[g_swingLoBar].h;
-         DoSell(sl, lbl);
+
+         //--- Check dashboard mode
+         if(g_tradeMode == 0 || g_tradeMode == 2)  // ALL or SELL ONLY
+            DoSell(sl, lbl);
+
          DrawLine(g_swingLo, g_swingLoTime, g_bars[last].t, InpBearColor, lbl, false);
       }
       g_swingLoBar = -1; g_swingLo = DBL_MAX;
@@ -183,10 +341,11 @@ void CheckBreak()
 //+------------------------------------------------------------------+
 void DoBuy(double sl, string comment)
 {
+   if(g_tradeMode == 3) { Print("[TRADER] STOPPED - no trade."); return; }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
    { Print("[TRADER] AutoTrading is OFF!"); return; }
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-   { Print("[TRADER] EA trading not allowed! Check Allow Algo Trading."); return; }
+   { Print("[TRADER] EA trading not allowed!"); return; }
    if(CountTrades() >= InpMaxTrades)
    { Print("[TRADER] Max trades reached."); return; }
 
@@ -196,7 +355,7 @@ void DoBuy(double sl, string comment)
 
    if(sl >= ask) sl = ask - 100 * pt;
    double dist = ask - sl;
-   if(dist <= 0) { Print("[TRADER] BUY skip: bad SL dist"); return; }
+   if(dist <= 0) { Print("[TRADER] BUY skip: bad SL"); return; }
 
    double lots = CalcLots(dist);
    double tp = (InpRR > 0) ? NormalizeDouble(ask + dist * InpRR, dig) : 0;
@@ -214,10 +373,11 @@ void DoBuy(double sl, string comment)
 //+------------------------------------------------------------------+
 void DoSell(double sl, string comment)
 {
+   if(g_tradeMode == 3) { Print("[TRADER] STOPPED - no trade."); return; }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
    { Print("[TRADER] AutoTrading is OFF!"); return; }
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-   { Print("[TRADER] EA trading not allowed! Check Allow Algo Trading."); return; }
+   { Print("[TRADER] EA trading not allowed!"); return; }
    if(CountTrades() >= InpMaxTrades)
    { Print("[TRADER] Max trades reached."); return; }
 
@@ -227,7 +387,7 @@ void DoSell(double sl, string comment)
 
    if(sl <= bid) sl = bid + 100 * pt;
    double dist = sl - bid;
-   if(dist <= 0) { Print("[TRADER] SELL skip: bad SL dist"); return; }
+   if(dist <= 0) { Print("[TRADER] SELL skip: bad SL"); return; }
 
    double lots = CalcLots(dist);
    double tp = (InpRR > 0) ? NormalizeDouble(bid - dist * InpRR, dig) : 0;
@@ -259,12 +419,12 @@ double CalcLots(double slDist)
    if(lots < lmin) lots = lmin;
    if(lots > lmax) lots = lmax;
 
-   //--- Check free margin before sending - cap lots to what we can afford
+   //--- Cap to available margin (max 80%)
    double margin = 0;
    if(OrderCalcMargin(ORDER_TYPE_BUY, Symbol(), lots, SymbolInfoDouble(Symbol(), SYMBOL_ASK), margin))
    {
       double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-      if(margin > freeMargin * 0.8)  // Use max 80% of free margin
+      if(margin > freeMargin * 0.8)
       {
          lots = lots * (freeMargin * 0.8) / margin;
          lots = MathFloor(lots / lstp) * lstp;

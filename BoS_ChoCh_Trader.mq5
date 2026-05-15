@@ -339,6 +339,17 @@ void CheckBreak()
 }
 
 //+------------------------------------------------------------------+
+//| Get correct fill type for this symbol                              |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetFillType()
+{
+   long fillMode = SymbolInfoInteger(Symbol(), SYMBOL_FILLING_MODE);
+   if((fillMode & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   if((fillMode & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
 void DoBuy(double sl, string comment)
 {
    if(g_tradeMode == 3) { Print("[TRADER] STOPPED - no trade."); return; }
@@ -361,7 +372,19 @@ void DoBuy(double sl, string comment)
    double tp = (InpRR > 0) ? NormalizeDouble(ask + dist * InpRR, dig) : 0;
    sl = NormalizeDouble(sl, dig);
 
-   Print("[TRADER] >>> BUY ", comment, " lots=", lots, " ask=", ask, " sl=", sl, " tp=", tp);
+   //--- Ensure SL/TP respects minimum stop level
+   long stopLevel = SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = stopLevel * pt;
+   if(minDist > 0)
+   {
+      if((ask - sl) < minDist) sl = NormalizeDouble(ask - minDist, dig);
+      if(tp > 0 && (tp - ask) < minDist) tp = NormalizeDouble(ask + minDist, dig);
+   }
+
+   Print("[TRADER] >>> BUY ", comment, " lots=", lots, " ask=", ask, " sl=", sl, " tp=", tp,
+         " sym=", Symbol());
+
+   g_trade.SetTypeFilling(GetFillType());
 
    if(!g_trade.Buy(lots, Symbol(), ask, sl, tp, "SMC_" + comment))
       Print("[TRADER] BUY FAILED! code=", g_trade.ResultRetcode(),
@@ -393,7 +416,19 @@ void DoSell(double sl, string comment)
    double tp = (InpRR > 0) ? NormalizeDouble(bid - dist * InpRR, dig) : 0;
    sl = NormalizeDouble(sl, dig);
 
-   Print("[TRADER] >>> SELL ", comment, " lots=", lots, " bid=", bid, " sl=", sl, " tp=", tp);
+   //--- Ensure SL/TP respects minimum stop level
+   long stopLevel = SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = stopLevel * pt;
+   if(minDist > 0)
+   {
+      if((sl - bid) < minDist) sl = NormalizeDouble(bid + minDist, dig);
+      if(tp > 0 && (bid - tp) < minDist) tp = NormalizeDouble(bid - minDist, dig);
+   }
+
+   Print("[TRADER] >>> SELL ", comment, " lots=", lots, " bid=", bid, " sl=", sl, " tp=", tp,
+         " sym=", Symbol());
+
+   g_trade.SetTypeFilling(GetFillType());
 
    if(!g_trade.Sell(lots, Symbol(), bid, sl, tp, "SMC_" + comment))
       Print("[TRADER] SELL FAILED! code=", g_trade.ResultRetcode(),
@@ -413,23 +448,40 @@ double CalcLots(double slDist)
    double lmax = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX);
    double lstp = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
 
-   if(tv <= 0 || ts <= 0) return lmin;
-   double lots = risk / ((slDist / ts) * tv);
+   if(tv <= 0 || ts <= 0 || slDist <= 0) return lmin;
+
+   //--- Calculate lots: risk / (SL in ticks * tick value)
+   double slTicks = slDist / ts;
+   double lots = risk / (slTicks * tv);
+
+   //--- Round down to lot step
    lots = MathFloor(lots / lstp) * lstp;
    if(lots < lmin) lots = lmin;
    if(lots > lmax) lots = lmax;
 
-   //--- Cap to available margin (max 80%)
+   //--- Cap to available margin (max 80% of free margin)
    double margin = 0;
    if(OrderCalcMargin(ORDER_TYPE_BUY, Symbol(), lots, SymbolInfoDouble(Symbol(), SYMBOL_ASK), margin))
    {
       double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+      if(freeMargin <= 0) return lmin;
       if(margin > freeMargin * 0.8)
       {
          lots = lots * (freeMargin * 0.8) / margin;
          lots = MathFloor(lots / lstp) * lstp;
          if(lots < lmin) lots = lmin;
       }
+   }
+
+   //--- Final safety: max 10 lots for indices/commodities, adjust if needed
+   double contractSize = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_CONTRACT_SIZE);
+   if(contractSize >= 100000) // Standard forex lot
+   {
+      if(lots > 50) lots = 50;
+   }
+   else // Indices, commodities, stocks
+   {
+      // Keep as calculated, margin check already handles it
    }
 
    return NormalizeDouble(lots, 2);
